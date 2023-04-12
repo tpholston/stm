@@ -7,7 +7,6 @@ Authors: [Tyler Holston](tholston@ucsd.edu), [Umberto Mignozetti](umbertomig@ucs
 Please email all comments/questions to: tholston@ucsd.edu
 
 [![PyPI Version](https://img.shields.io/pypi/v/your-package-name)](https://pypi.org/project/your-package-name/)
-[![PyPI Downloads](https://img.shields.io/pypi/v/your-package-name)](https://pypi.org/project/your-package-name/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/your-username/your-package-name/blob/master/LICENSE)
 
 ## Summary
