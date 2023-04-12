@@ -1,4 +1,4 @@
-# stm: A Python Package for the Structural Topic Model
+# py_stm: A Python Package for the Structural Topic Model
 
 Website: www.structuraltopicmodel.com
 
