@@ -56,24 +56,24 @@ class FakeDict:
 		return default
 
 def get_max_id(documents):
-    """Get the highest feature id that appears in the corpus.
-    Parameters
-    ----------
-    corpus : iterable of iterable of (int, numeric)
-        Collection of texts in BoW format.
-    Returns
-    ------
-    int
-        Highest feature id.
-    Notes
-    -----
-    For empty `corpus` return -1.
-    """
-    maxid = -1
-    for document in documents:
-        if document:
-            maxid = max(maxid, max(fieldid for fieldid, _ in document))
-    return maxid
+	"""Get the highest feature id that appears in the corpus.
+	Parameters
+	----------
+	corpus : iterable of iterable of (int, numeric)
+	Collection of texts in BoW format.
+	Returns
+	------
+	int
+	Highest feature id.
+	Notes
+	-----
+	For empty `corpus` return -1.
+	"""
+	maxid = -1
+	for document in documents:
+		if document:
+			maxid = max(maxid, max(fieldid for fieldid, _ in document))
+	return maxid
 
 def vocab_from_documents(documents):
 	"""Scan documents for all word ids that appear in it, then construct a mapping
