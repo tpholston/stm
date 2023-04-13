@@ -5,22 +5,23 @@ from . import utils
 logger = logging.getLogger(__name__)
 
 class Stm:
-	def __init__(self, documents=None, vocab=None, K=100,
-        	prevalence=None, content=None, data=None,
-                init_type=["Spectral", "LDA", "Random", "Custom"], seed=None,
-                max_em_its=500, emtol=1e-5,
-                verbose=True, reportevery=5,
-                LDAbeta=True, interactions=True,
-                ngroups=1, model=None,
-                gamma_prior=["Pooled", "L1"], sigma_prior=0,
-                kappa_prior=["L1", "Jeffreys"], control=[]):
+	def __init__(self, documents=None, vocab=None, k=100,
+		prevalence=None, content=None, data=None,
+		init_type="LDA", seed=None,
+		max_em_its=500, emtol=1e-5,
+		verbose=True, reportevery=5,
+		lda_beta=True, interactions=True,
+		ngroups=1, model=None,
+		gamma_prior="Pooled", sigma_prior=0,
+		kappa_prior="L1"):
 		"""
 		Parameters
 		----------
 		documents : iterable, optional
 			List of documents to be processed. Each document can be a string or a list of words.
 		vocab : list, optional
-			List of words in the vocabulary. If not provided, the vocabulary will be extracted from the documents.
+			List of words in the vocabulary. If not provided, the vocabulary 
+			will be extracted from the documents.
 		K : int, optional
 			Number of topics to be extracted from the documents.
 		prevalence : array-like, optional
@@ -61,8 +62,10 @@ class Stm:
 
 		self.vocab = vocab
 		if documents is None and self.vocab is None:
-			raise ValueError('at least one of documents/vocab must be specified to establish input space dimensionality')
-		
+			raise ValueError(
+				'at least one of documents/vocab must be specified to establish input space dimensionality'
+			)
+
 		if self.vocab is None:
 			logger.warning('no vocab word id mapping provided; initializing from documents')
 			self.vocab = utils.vocab_from_documents(documents)
@@ -71,6 +74,6 @@ class Stm:
 			self.num_terms = 1 + max(self.vocab.keys())
 		else:
 			self.num_terms = 0
-		
+
 		if self.num_terms == 0:
 			raise ValueError('cannot compute STM over an empty collection (no terms)')
