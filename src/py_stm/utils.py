@@ -1,11 +1,12 @@
 import numpy as np
 from scipy.sparse import csc_matrix, issparse
+import patsy as pt
 
 
 class FakeDict:
-    """Objects of this class act as dictionaries that map integer->str(integer), for a specified
-    range of integers <0, num_terms). This is meant to avoid allocating real dictionaries when
-    `num_terms` is huge, which is a waste of memory.
+    """Objects of this class act as dictionaries that map integer->str(integer), 
+    for a specified range of integers <0, num_terms). This is meant to avoid 
+    allocating real dictionaries when `num_terms` is huge, which is a waste of memory.
     """
 
     def __init__(self, num_terms):
@@ -40,8 +41,8 @@ class FakeDict:
             yield i, str(i)
 
     def keys(self):
-        """Override the `dict.keys()`, which is used to determine the maximum internal id of a corpus,
-        i.e. the vocabulary dimensionality.
+        """Override the `dict.keys()`, which is used to determine 
+        the maximum internal id of a corpus, i.e. the vocabulary dimensionality.
         Returns
         -------
         list of int
@@ -68,7 +69,8 @@ class FakeDict:
                 String of dictionary id.
         Notes
         -----
-        Will return None if the id is not in the dictionary (if is not in the range 0 to num_terms).
+        Will return None if the id is not in the dictionary 
+        (if is not in the range 0 to num_terms).
         """
         if 0 <= val < self.num_terms:
             return str(val)
@@ -109,9 +111,10 @@ def vocab_from_documents(documents):
             "Fake" mapping which maps each `word_id` -> `str(word_id)`.
     Warnings
     --------
-    This function is used whenever *words* need to be displayed (as opposed to just their ids)
-    but no `word_id` -> `word` mapping was provided. The resulting mapping only covers words actually
-    used in the corpus, up to the highest `word_id` found.
+    This function is used whenever *words* need to be displayed 
+    (as opposed to just their ids) but no `word_id` -> `word` mapping was provided. 
+    The resulting mapping only covers words actually used in the corpus, 
+    up to the highest `word_id` found.
     """
     num_terms = 1 + get_max_id(documents)
     vocab = FakeDict(num_terms)
@@ -163,46 +166,40 @@ def is_valid_init_type(init_type):
     return init_type in ["Spectral", "LDA", "Random", "Custom"]
 
 
-def make_top_matrix(x, data=None):
+def make_top_matrix(prevalence, data=None):
     """
     Create a sparse matrix from a prevalence-covariate design matrix in Python.
 
     Parameters:
-    x (str or array-like): Either a formula or a matrix.
-    data (pandas.DataFrame, optional): The data to use with the formula. Default is None.
+    prevalence (str or array-like): 
+        Either a formula or a matrix.
+    data (pandas.DataFrame, optional): 
+        The data to use with the formula. Default is None.
 
     Returns:
-    scipy.sparse.csc_matrix: A compressed sparse column matrix.
+    scipy.sparse.csc_matrix: 
+        A compressed sparse column matrix.
 
     Raises:
-    TypeError: If the input is not a formula or a matrix.
-
-    Notes:
-    - If x is a formula, the function first checks if it is a prevalence formula and then creates a sparse model matrix using the Matrix package.
-    - If this fails, the function creates a standard model matrix using the stats package.
-    - If the resulting matrix is less than 50% sparse or has fewer than 50 columns, the function converts it to a standard matrix.
-    - If x is a matrix, the function checks if it has an intercept in the first column.
-    - If it does, the function returns the matrix as a sparse matrix.
-    - Otherwise, the function adds a column of 1s to the matrix and returns it as a sparse matrix.
+    TypeError: 
+        If the input is not a formula or a matrix.
     """
-    if isinstance(x, str):
-        termobj = data[x]
-        if termobj.response == 1:
-            raise ValueError(
-                "Response variables should not be included in prevalence formula.")
-        xmat = termobj.sparse_model_matrix()
-        propSparse = 1 - np.count_nonzero(xmat) / xmat.size
-        if propSparse < 0.5 or xmat.shape[1] < 50:
-            xmat = xmat.toarray()
-        return csc_matrix(xmat)
-    elif isinstance(x, np.ndarray):
-        if np.all(x[:, 0] == 1):
-            return csc_matrix(x)
+    if isinstance(prevalence, str):
+        # TODO: This component needs heavy testing
+        if len(prevalence.split("~")) == 2:
+            raise ValueError("response variables should not be included in prevalence formula.")
+        prevalence_mat = pt.dmatrix(formula=prevalence, data=data, sparse=True)
+        prop_sparse = 1 - np.count_nonzero(prevalence_mat) / prevalence_mat.size
+        if prop_sparse < 0.5 or prevalence_mat.shape[1] < 50:
+            prevalence_mat = prevalence_mat.toarray()
+        return csc_matrix(prevalence_mat)
+    if isinstance(prevalence, np.ndarray):
+        if np.all(prevalence[:, 0] == 1):
+            return csc_matrix(prevalence)
         else:
-            xmat = np.concatenate((np.ones((x.shape[0], 1)), x), axis=1)
-            return csc_matrix(xmat)
-    else:
-        raise TypeError("Input must be a formula or a matrix.")
+            prevalence_mat = np.concatenate((np.ones((prevalence.shape[0], 1)), prevalence), axis=1)
+            return csc_matrix(prevalence_mat)
+    raise TypeError("input must be a formula or a matrix.")
 
 
 def to_internal_stm_format(documents, vocab, data):
@@ -211,16 +208,18 @@ def to_internal_stm_format(documents, vocab, data):
     Parameters
     ----------
     documents : sparse matrix or numpy array
-            Input documents data, can be either a sparse matrix or a numpy array.
+        Input documents data, can be either a sparse matrix or a numpy array.
     vocab : dict or None
-            Vocabulary dictionary or None, if None and documents is a numpy array, a vocabulary will be created.
+        Vocabulary dictionary or None, if None and documents 
+        is a numpy array, a vocabulary will be created.
     data : any
-            Additional data for STM. Can be used for covariate information.
+        Additional data for STM. Can be used for covariate information.
 
     Returns
     -------
     tuple
-            Converted documents data, converted vocabulary dictionary or created vocabulary for numpy array documents, additional data for STM
+        Converted documents data, converted vocabulary dictionary or 
+        created vocabulary for numpy array documents, additional data for STM
     """
     if issparse(documents):
         # for sparse matrix will recreate vocab regardless of if provided

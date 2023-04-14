@@ -1,5 +1,7 @@
 import logging
 import numpy as np
+import patsy as pt
+import pandas as pd
 from scipy.sparse import issparse
 
 from . import utils
@@ -45,7 +47,7 @@ class Stm:
         vocab : list, optional
                 List of words in the vocabulary. If not provided, the vocabulary
                 will be extracted from the documents. Not necessary for sparse matrix.
-        K : int, optional
+        k : int, optional
                 Number of topics to be extracted from the documents.
         prevalence : array-like, optional
                 Prior prevalence of topics. If not provided, uniform prior will be used.
@@ -95,11 +97,13 @@ class Stm:
             if not all(isinstance(doc, np.ndarray)
                        and doc.ndim == 2 for doc in documents):
                 raise ValueError(
-                    "each list element in documents must be a matrix. See documentation.")
+                    "each list element in documents must be a matrix. See documentation."
+                )
             if any(np.any(np.diff(doc[0, :]) == 0) for doc in documents):
                 raise ValueError(
-                    "duplicate term indices within a document. See documentation for proper format.")
-        self.N = len(self.documents)
+                    "duplicate term indices within a document. See documentation for proper format."
+                )
+        self.num_documents = len(self.documents)
 
         # Convert to a standard internal STM format here
         self.documents, self.vocab, self.data = utils.to_internal_stm_format(
@@ -119,8 +123,8 @@ class Stm:
                 np.unique(wcountvec)) + 1)):
             raise ValueError(
                 "word indices must be sequential integers starting with 1.")
-        V, wcounts = np.unique(wcountvec, return_counts=True)
-        if len(vocab) != V:
+        num_vocab, wcounts = np.unique(wcountvec, return_counts=True)
+        if len(vocab) != num_vocab:
             raise ValueError(
                 "vocab length does not match observed word indices.")
 
@@ -130,19 +134,24 @@ class Stm:
         if k != 0:
             if not isinstance(k, int) or k <= 1:
                 raise ValueError(
-                    "k must be a positive integer greater than 1.")
+                    "k must be a positive integer greater than 1."
+                )
             if k == 2:
                 logger.warning(
-                    "k=2 is equivalent to a unidimensional scaling model which you may prefer.")
+                    "k=2 is equivalent to a unidimensional scaling model which you may prefer."
+                )
         else:
             if init_type != "Spectral":
                 raise ValueError(
-                    "Topic selection method can only be used with init_type='Spectral'.")
+                    "Topic selection method can only be used with init_type='Spectral'."
+                )
 
         # Iterations
         if not (isinstance(max_em_its, int) and max_em_its >= 0):
             raise ValueError(
-                "Max EM iterations must be a single non-negative integer.")
+                "Max EM iterations must be a single non-negative integer."
+            )
+        self.max_eme_its = max_em_its
 
         # Verbose
         if not isinstance(verbose, bool):
@@ -156,9 +165,60 @@ class Stm:
                     prevalence,
                     str):
                 raise ValueError(
-                    "prevalence covariates must be specified as a model matrix or as a formula.")
-            xmat = utils.make_top_matrix(prevalence, data)
-            if np.isnan(np.count_nonzero(xmat)):
+                    "prevalence covariates must be specified as a model matrix or as a formula."
+                )
+            prevalence_mat = utils.make_top_matrix(prevalence, data)
+            if np.isnan(np.count_nonzero(prevalence_mat)):
                 raise ValueError("missing values in prevalence covariates.")
         else:
-            xmat = None
+            prevalence_mat = None
+
+        if content is not None:
+            if isinstance(content, str):
+                if len(content.split("~")) == 2:
+                    raise ValueError("response variables should not be included in prevalence formula.")
+                termobj = pt.dmatrix(content, data=data)
+                if len(termobj.design_info.terms) != 1:
+                    raise ValueError("currently content can only contain one variable.")
+                if data is None:
+                    yvar = pd.Series(termobj[:, 0], name=termobj.design_info.column_name(0))
+                else:
+                    char = termobj.design_info.column_name(0)
+                    yvar = data[char]
+                yvar = pd.factorize(yvar)[0]
+            else:
+                yvar = pd.factorize(content)[0]
+            if np.any(pd.isna(yvar)):
+                raise ValueError(
+                    "your content covariate contains missing values. All values of " +
+                    "the content covariate must be observed."
+                )
+            yvarlevels = np.unique(yvar)
+            betaindex = yvar
+        else:
+            yvarlevels = None
+            betaindex = np.repeat(1, len(documents))
+        a = len(np.unique(betaindex))  # define the number of aspects
+
+        # check for dimension agreement
+        ny = len(betaindex)
+        nx = self.num_documents if prevalence_mat is None else prevalence_mat.shape[0]
+        if self.num_documents != nx or self.num_documents != ny:
+            raise ValueError(
+                f"number of observations in content covariate ({ny}) prevalence covariate ({nx}) " + 
+                "and documents ({self.num_documents}) are not all equal."
+            )
+        
+        # some additional sanity checks
+        if not isinstance(lda_beta, bool):
+            raise ValueError("lda_beta must be boolean")
+        if not isinstance(interactions, bool):
+            raise ValueError("interactions variable must be boolean")
+        if sigma_prior < 0 or sigma_prior > 1:
+            raise ValueError("sigma_prior must be between 0 and 1")
+        if model is not None:
+            if(max_em_its <= model.max_em_its):
+                raise ValueError(
+                    "when restarting a model, max_em_its represents the total iterations of the model " +
+                    "and thus must be greater than the length of the original run."
+                )
