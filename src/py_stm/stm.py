@@ -1,10 +1,31 @@
 import logging
+import numpy as np
+from scipy.sparse import issparse
 
 from . import utils
 
 logger = logging.getLogger(__name__)
 
 class Stm:
+	"""
+	Class representing a topic model using the Structural Topic Model (STM) algorithm.
+
+	...
+	
+	Methods
+	-------
+	__init__(self, documents, vocab=None, data=None, num_topics=10, alpha=0.01, eta=0.01, diagnostics=True, vocabulary=None)
+		Initialize the STM model with given parameters
+	estimate(self, max_em_iter=100, em_tol=1e-04, initialize=True, verbose=False)
+		Estimate the parameters of the STM model using the Expectation-Maximization (EM) algorithm
+	infer_topics(self, new_documents)
+		Infer topic proportions for new documents using the trained STM model
+	get_topic_proportions(self)
+		Get the estimated topic proportions for the input documents
+	get_topic_assignments(self)
+		Get the estimated topic assignments for the input documents
+	...
+	"""
 	def __init__(self, documents=None, vocab=None, k=100,
 		prevalence=None, content=None, data=None,
 		init_type="LDA", seed=None,
@@ -18,10 +39,10 @@ class Stm:
 		Parameters
 		----------
 		documents : iterable, optional
-			List of documents to be processed. Each document can be a string or a list of words.
+			List of documents to be processed. Each document is a list of words. Can be a sparse matrix.
 		vocab : list, optional
 			List of words in the vocabulary. If not provided, the vocabulary 
-			will be extracted from the documents.
+			will be extracted from the documents. Not necessary for sparse matrix.
 		K : int, optional
 			Number of topics to be extracted from the documents.
 		prevalence : array-like, optional
@@ -60,20 +81,59 @@ class Stm:
 			Control list for advanced options.
 		"""
 
-		self.vocab = vocab
-		if documents is None and self.vocab is None:
-			raise ValueError(
-				'at least one of documents/vocab must be specified to establish input space dimensionality'
-			)
+		# Documents
+		if documents is None:
+			raise ValueError("documents must be specified.")
+		if isinstance(documents, list):
+			documents = np.array(documents)
+		if not (isinstance(documents, np.ndarray) or issparse(documents)):
+			raise ValueError("documents must be of type list, np.ndarray, or sparse matrix.")
+		if isinstance(documents, np.ndarray):		
+			if not all(isinstance(doc, np.ndarray) and doc.ndim == 2 for doc in documents):
+				raise ValueError("each list element in documents must be a matrix. See documentation.")
+			if any(np.any(np.diff(doc[0, :]) == 0) for doc in documents):
+				raise ValueError("duplicate term indices within a document. See documentation for proper format.")
+		self.N = len(self.documents)	
 
-		if self.vocab is None:
-			logger.warning('no vocab word id mapping provided; initializing from documents')
-			self.vocab = utils.vocab_from_documents(documents)
-			self.num_terms = len(self.vocab)
-		elif len(self.vocab) > 0:
-			self.num_terms = 1 + max(self.vocab.keys())
+		# Convert to a standard internal STM format here
+		self.documents, self.vocab, self.data = utils.to_internal_stm_format(documents, vocab, data)
+
+		# Extract and check the word indices
+		wcountvec = np.concatenate([np.repeat(x[0, :], x[1, :]) for x in self.documents])
+		if not np.issubdtype(wcountvec.dtype, np.integer) or np.any(wcountvec <= 0):
+			raise ValueError("word indices are not positive integers.")
+		if not np.array_equal(np.unique(wcountvec), np.arange(1, len(np.unique(wcountvec)) + 1)):
+			raise ValueError("word indices must be sequential integers starting with 1.")
+		V, wcounts = np.unique(wcountvec, return_counts=True)
+		if len(vocab) != V:
+			raise ValueError("vocab length does not match observed word indices.")
+		
+		# Check the number of topics
+		if k is None:
+			raise ValueError("k, the number of topics, is required.")
+		if k != 0:
+			if not isinstance(k, int) or k <= 1:
+				raise ValueError("k must be a positive integer greater than 1.")
+			if k == 2:
+				logger.warning("k=2 is equivalent to a unidimensional scaling model which you may prefer.")
 		else:
-			self.num_terms = 0
+			if init_type != "Spectral":
+				raise ValueError("Topic selection method can only be used with init_type='Spectral'.")
+			
+		# Iterations
+		if not (isinstance(max_em_its, int) and max_em_its >= 0):
+			raise ValueError("Max EM iterations must be a single non-negative integer.")
+		
+		# Verbose
+		if not isinstance(verbose, bool):
+			raise ValueError("Verbose must be a boolean value.")
 
-		if self.num_terms == 0:
-			raise ValueError('cannot compute STM over an empty collection (no terms)')
+		# Now we parse both sets of covariates
+		if prevalence is not None:
+			if not isinstance(prevalence, np.ndarray) and not isinstance(prevalence, str):
+				raise ValueError("prevalence covariates must be specified as a model matrix or as a formula.")
+			xmat = utils.make_top_matrix(prevalence, data)
+			if np.isnan(np.count_nonzero(xmat)):
+				raise ValueError("missing values in prevalence covariates.")
+		else:
+			xmat = None
