@@ -4,6 +4,7 @@ import patsy as pt
 import pandas as pd
 from scipy.sparse import issparse
 
+from convergence import Convergence
 from . import utils
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,16 @@ class Stm:
                 Kappa prior type for content covariance. Can be one of ["L1", "Jeffreys"].
         control : list, optional
                 Control list for advanced options.
-        """
+		"""
+
+        if not utils.is_valid_gamma_prior(gamma_prior):
+            raise ValueError('invalid gamma prior. Should be one of ["L1", "Pooled"]')
+		
+        if not utils.is_valid_init_type(init_type):
+            raise ValueError('invalid init type. Should be one of ["Spectral", "LDA", "Random", "Custom"]')
+		
+        if not utils.is_valid_kappa_prior(kappa_prior):
+            raise ValueError('invalid kappa prior. Should be one of ["L1", "Jeffreys"]')
 
         # Documents
         if documents is None:
@@ -103,7 +113,7 @@ class Stm:
                 raise ValueError(
                     "duplicate term indices within a document. See documentation for proper format."
                 )
-        self.num_documents = len(self.documents)
+        n = len(self.documents)
 
         # Convert to a standard internal STM format here
         self.documents, self.vocab, self.data = utils.to_internal_stm_format(
@@ -123,8 +133,8 @@ class Stm:
                 np.unique(wcountvec)) + 1)):
             raise ValueError(
                 "word indices must be sequential integers starting with 1.")
-        num_vocab, wcounts = np.unique(wcountvec, return_counts=True)
-        if len(vocab) != num_vocab:
+        v, wcounts = np.unique(wcountvec, return_counts=True)
+        if len(vocab) != v:
             raise ValueError(
                 "vocab length does not match observed word indices.")
 
@@ -151,7 +161,6 @@ class Stm:
             raise ValueError(
                 "Max EM iterations must be a single non-negative integer."
             )
-        self.max_eme_its = max_em_its
 
         # Verbose
         if not isinstance(verbose, bool):
@@ -222,3 +231,43 @@ class Stm:
                     "when restarting a model, max_em_its represents the total iterations of the model " +
                     "and thus must be greater than the length of the original run."
                 )
+            
+		# set a lot of instance variables
+
+        # dim ? these need better variable names just 
+        # trying to follow the STM code right now though
+        self.k = int(k) # K -> number of topics
+        self.a = a # A -> number of aspects
+        self.v = v # V -> number of vocab
+        self.n = n # N -> number of documents
+        self.wcounts = wcounts
+
+        self.verbose = verbose
+        self.reportevery = reportevery
+
+        # convergance related variables
+        self.convergence = Convergence(max_em_its, emtol, allow_negative_change=True)
+
+        # covariates related variables
+        self.prevalence_matrix =  prevalence_mat # X -> prevalence matrix
+        self.betaindex = betaindex
+        self.yvarlevels = yvarlevels
+        self.formula = prevalence
+
+        # gamma related variables
+        self.mode = gamma_prior
+        self.prior = None
+        self.enet = 1
+        self.ic_k = 2
+        self.max_its = 1000
+
+        # sigma related variables
+        self.prior = sigma_prior
+
+        settings = { 
+            dim: { k: k},
+            verbose: verbose,
+
+		# set the random seed if passed in as a parameter
+        if seed is not None:
+            np.random.seed(seed)
