@@ -5,7 +5,14 @@ import pandas as pd
 from scipy.sparse import issparse
 
 from convergence import Convergence
+from covariates import Covariates
+from gamma import Gamma
+from sigma import Sigma
+from kappa import Kappa
+from tau import Tau
+from init import Init
 from . import utils
+from constants import LEGAL_ARGS
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +46,7 @@ class Stm:
                  lda_beta=True, interactions=True,
                  ngroups=1, model=None,
                  gamma_prior="Pooled", sigma_prior=0,
-                 kappa_prior="L1"):
+                 kappa_prior="L1", control={}):
         """
         Parameters
         ----------
@@ -134,6 +141,7 @@ class Stm:
             raise ValueError(
                 "word indices must be sequential integers starting with 1.")
         v, wcounts = np.unique(wcountvec, return_counts=True)
+        v = len(v)
         if len(vocab) != v:
             raise ValueError(
                 "vocab length does not match observed word indices.")
@@ -249,24 +257,104 @@ class Stm:
         self.convergence = Convergence(max_em_its, emtol, allow_negative_change=True)
 
         # covariates related variables
-        self.prevalence_matrix =  prevalence_mat # X -> prevalence matrix
-        self.betaindex = betaindex
-        self.yvarlevels = yvarlevels
-        self.formula = prevalence
+        self.covariates = Covariates(prevalence_mat, betaindex, yvarlevels, prevalence)
 
         # gamma related variables
-        self.mode = gamma_prior
-        self.prior = None
-        self.enet = 1
-        self.ic_k = 2
-        self.max_its = 1000
+        self.gamma = Gamma(gamma_prior)
 
         # sigma related variables
-        self.prior = sigma_prior
+        self.sigma = Sigma(sigma_prior)
 
-        settings = { 
-            dim: { k: k},
-            verbose: verbose,
+        # kappa related variables
+        self.kappa = Kappa(lda_beta, interactions)
+
+        # tau related variables
+        self.tau = Tau(kappa_prior)
+
+        # init realted variables
+        self.init = Init(init_type, 50/k)
+
+        self.seed = seed
+        self.ngroups = ngroups
+
+        if self.init.mode == "Spectral" and self.v > 10000:
+            self.init.max_v = 10000
+
+        if self.gamma.mode == "L1" and prevalence_mat.shape[1] <= 2:
+            raise ValueError("cannot use L1 penalization in prevalence model with 2 or fewer covariates.")
+        
+        # is there a covariate on top?
+        if prevalence is None:
+            self.gamma.mode = "CTM" # without covariates has to be estimating the mean.
+        
+        # is there a covariate on the bottom?
+        if content is None:
+            self.kappa.interactions = False # can't have interactions without a covariate
+        else:
+            self.kappa.lda_beta = False # can't do LDA topics with a covariate
+        
+        for key, value in control.items():
+            if key not in LEGAL_ARGS:
+                raise ValueError(f"Argument {key} not matched")
+            if key == "tau_maxit":
+                self.tau.maxit = value
+            if key == "tau_tol":
+                self.tau.tol = value
+            if key == "fixed_intercept":
+                self.kappa.fixed_intercept = value
+            if key == "kappa_enet":
+                self.tau.enet = value
+            if key == "kappa_mstep_maxit":
+                self.kappa.mstep_maxit = value
+            if key == "kappa_mstep_tol":
+                self.kappa.mstep_tol = value
+            if key == "nlambda":
+                self.tau.nlambda = value
+            if key == "lambda_min_ratio":
+                self.tau.lambda_min_ratio = value
+            if key == "ic_k":
+                self.tau.ic_k = value
+            if key == "gamma_enet":
+                self.gamma.enet = value
+            if key == "gamma_ic_k":
+                self.gamma.ic_k = value
+            if key == "nits":
+                self.init.nits = value
+            if key == "burnin":
+                self.init.burnin = value
+            if key == "alpha":
+                self.init.alpha = value
+            if key == "eta":
+                self.init.eta = value
+            if key == "contrast":
+                self.kappa.contrast = value
+            if key == "rp_s":
+                self.init.s = value
+            if key == "rp_p":
+                self.init.p = value
+            if key == "rp_d_group_size":
+                self.init.d_group_size = value
+            if key == "spectral_IRP" and value:
+                self.init.mode = "SpectralRP"
+            if key == "recoverEG" and not value:
+                self.init.recoverEG = value
+            if key == "max_v" and value:
+                self.init.max_v = value
+                if self.init.max_v > self.v:
+                    raise ValueError("max_v cannot be larger than the vocabulary")
+            if key == "tSNE_init_dims" and value:
+                self.init.tSNE_init_dims = value
+            if key == "tSNE_perplexity" and value:
+                self.init.tSNE_perplexity = value
+            if key == "gamma_maxits":
+                self.gamma.max_its = value
+            if key == "allow_negative_change":
+                self.convergence.allow_negative_change = value
+            if key == "custom_beta":
+                if self.init.mode != "Custom":
+                    logger.warning("custom beta supplied, setting init argument to Custom.")
+                    self.init.mode = "Custom"
+                self.init.custom = value                
 
 		# set the random seed if passed in as a parameter
         if seed is not None:
