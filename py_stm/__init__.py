@@ -8,4 +8,4 @@ and creating visualizations for analysis.
 """
 
 # bring model classes directly into package namespace, to save some typing
-from .stm import Stm
+from .stm import StmModel
