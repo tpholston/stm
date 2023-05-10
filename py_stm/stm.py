@@ -3,7 +3,7 @@ import time
 import numbers
 import os
 import numpy as np
-import patsy as pt
+from patsy import ModelDesc, dmatrix
 import pandas as pd
 from collections import defaultdict
 
@@ -24,7 +24,8 @@ from .stmState import StmState
 from . import utils
 
 class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
-    def __init__(self, corpus=None, num_topics=100, id2word=None,
+    def __init__(self, corpus=None, num_topics=100, id2word=None, 
+                 metadata=None, prevalence=None, content=None,
                  chunksize=2000, passes=1, update_every=1,
                  alpha='symmetric', eta=None, decay=0.5, offset=1.0, eval_every=10,
                  iterations=50, gamma_threshold=0.001, minimum_probability=0.01,
@@ -45,6 +46,13 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         id2word : {dict of (int, str), :class:`gensim.corpora.dictionary.Dictionary`}
             Mapping from word IDs to words. It is used to determine the vocabulary size, as well as for
             debugging and topic printing.
+        metadata : (pandas.DataFrame, numpy.ndarray), optional
+            Optional dataframe containing the prevalence and/or content covariates. 
+        prevalence : (pandas.DataFrame, numpy.ndarray, str), optional
+            A formula object with no response variable or a matrix containing topic prevalence covariates.
+        content : str, optional
+            A formula containing a single variable, a factor variable or something which can be coerced
+            to a factor indicating the category of the content variable for each document.
         chunksize :  int, optional
             Number of documents to be used in each training chunk.
         passes : int, optional
@@ -133,6 +141,35 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         self.per_word_topics = per_word_topics
         self.callbacks = callbacks
 
+        # covariates TODO: PLEASE TEST
+        if prevalence is not None:
+            self.covariates = utils.make_top_matrix(prevalence, metadata)
+            if np.isnan(np.count_nonzero(self.covariates)):
+                raise ValueError("Missing values in prevalence covariates.")
+        else:
+            self.covariates = None
+
+        if content is not None:
+            if isinstance(content, str):
+                desc = ModelDesc.from_formula(content)
+                if desc.lhs_termlist != []:
+                    raise ValueError("Response variables should not be included in the content formula.")
+                if len(desc.rhs_termlist) != 2:
+                    raise ValueError("Currently, content can only contain one variable.")
+                yvar = dmatrix(content, data=metadata, return_type='dataframe')
+                self.yvarlevels = pd.Categorical(yvar).codes.astype(float) 
+                self.betaindex = np.argmax(yvar.iloc[:, 1:].values, axis=1) + 1
+            else:
+                raise ValueError("Invalid content parameter. Expected formula (str).")
+            
+            if yvar.isnull().any().any():
+                raise ValueError("Your content covariate contains missing values. All values of the content covariate must be observed.")
+        else:
+            self.yvarlevels = None
+            self.betaindex = np.ones(len(metadata))
+
+        # hyperparams
+
         self.alpha, self.optimize_alpha = self.init_dir_prior(alpha, 'alpha')
         assert self.alpha.shape == (self.num_topics,), \
             "Invalid alpha shape. Got shape %s, but expected (%d, )" % (str(self.alpha.shape), self.num_topics)
@@ -151,7 +188,6 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         logger.info("using serial STM version on this node")
 
         # Initialize the variational distribution q(beta|lambda)
-        # TODO: create StmState
         self.state = StmState(self.eta, (self.num_topics, self.num_terms), dtype=self.dtype)
         self.state.sstats[...] = self.random_state.gamma(100., 1. / 100., (self.num_topics, self.num_terms))
         self.expElogbeta = np.exp(dirichlet_expectation(self.state.sstats))
@@ -561,6 +597,12 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         if lencorpus == 0:
             logger.warning("StmModel.update() called with an empty corpus")
             return
+
+        # Checks for Dimension agreement
+        ny = len(self.betaindex)
+        nx = self.covariates.shape[0] if self.covariates is not None else lencorpus
+        if( lencorpus != nx or lencorpus != ny):
+            raise ValueError(f"Number of observations in content covaraite ({ny}) prevalence covariate ({nx}) and documents ({lencorpus}) are not all equal.")
 
         if chunksize is None:
             chunksize = min(lencorpus, self.chunksize)
