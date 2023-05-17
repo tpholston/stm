@@ -9,6 +9,7 @@ from collections import defaultdict
 
 from scipy.sparse import issparse
 from scipy.special import gammaln
+from scipy.linalg import cholesky
 
 from gensim.models import basemodel, CoherenceModel
 from gensim import interfaces
@@ -157,8 +158,9 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                 if len(desc.rhs_termlist) != 2:
                     raise ValueError("Currently, content can only contain one variable.")
                 yvar = dmatrix(content, data=metadata, return_type='dataframe')
-                self.yvarlevels = pd.Categorical(yvar).codes.astype(float) 
-                self.betaindex = np.argmax(yvar.iloc[:, 1:].values, axis=1) + 1
+                yvar_categorical = pd.Categorical(yvar.iloc[:, 0])  # assuming yvar is a DataFrame with a single column
+                self.yvarlevels = yvar_categorical.categories.tolist()
+                self.betaindex = yvar_categorical.codes
             else:
                 raise ValueError("Invalid content parameter. Expected formula (str).")
             
@@ -188,6 +190,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         logger.info("using serial STM version on this node")
 
         # Initialize the variational distribution q(beta|lambda)
+        # TODO: modify this component depending on what we figure out in the inference()
         self.state = StmState(self.eta, (self.num_topics, self.num_terms), dtype=self.dtype)
         self.state.sstats[...] = self.random_state.gamma(100., 1. / 100., (self.num_topics, self.num_terms))
         self.expElogbeta = np.exp(dirichlet_expectation(self.state.sstats))
@@ -316,7 +319,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         self.expElogbeta = np.exp(current_Elogbeta)
         assert self.expElogbeta.dtype == self.dtype
 
-    def inference(self, chunk, collect_sstats=False):
+    def inference(self, chunk, collect_sstats=False, doc_covaraites=None, word_covariates=None):
         """Given a chunk of sparse document vectors, estimate gamma (parameters controlling the topic weights)
         for each document in the chunk.
 
@@ -333,6 +336,10 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         collect_sstats : bool, optional
             If set to True, also collect (and return) sufficient statistics needed to update the model's topic-word
             distributions.
+        doc_covariates : ndarray, optional
+            Document-level covariates, shape (`len(chunk)`,).
+        word_covariates : ndarray, optional
+            Word-level covariates, shape (`len(chunk)`,).
 
         Returns
         -------
@@ -422,7 +429,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         assert gamma.dtype == self.dtype
         return gamma, sstats
 
-    def do_estep(self, chunk, state=None):
+    def do_estep(self, chunk, state=None, doc_covariates=None, word_covariates=None):
         """Perform inference on a chunk of documents, and accumulate the collected sufficient statistics.
 
         Parameters
@@ -432,6 +439,10 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         state : :class:`~stm.StmState`, optional
             The state to be updated with the newly accumulated sufficient statistics. If none, the models
             `self.state` is updated.
+        doc_covariates : ndarray, optional
+            Document-level covariates, shape (`len(chunk)`,).
+        word_covariates : ndarray, optional
+            Word-level covariates, shape (`len(chunk)`,).
 
         Returns
         -------
@@ -441,7 +452,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         """
         if state is None:
             state = self.state
-        gamma, sstats = self.inference(chunk, collect_sstats=True)
+        gamma, sstats = self.inference(chunk, collect_sstats=True, doc_covariates=doc_covariates, word_covariates=word_covariates)
         state.sstats += sstats
         state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
         assert gamma.dtype == self.dtype
@@ -602,7 +613,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         ny = len(self.betaindex)
         nx = self.covariates.shape[0] if self.covariates is not None else lencorpus
         if( lencorpus != nx or lencorpus != ny):
-            raise ValueError(f"Number of observations in content covaraite ({ny}) prevalence covariate ({nx}) and documents ({lencorpus}) are not all equal.")
+            raise ValueError(f"Number of observations in content covariate ({ny}) prevalence covariate ({nx}) and documents ({lencorpus}) are not all equal.")
 
         if chunksize is None:
             chunksize = min(lencorpus, self.chunksize)
@@ -667,7 +678,16 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                     "PROGRESS: pass %i, at document #%i/%i",
                     pass_, chunk_no * chunksize + len(chunk), lencorpus
                 )
-                gammat = self.do_estep(chunk, other)
+
+                # get the document indices for this chunk
+                # TODO: go back to make sure this min() works effectively. Should only be relevant for dirty doc chunks.
+                doc_indices = range(chunk_no * chunksize, min(chunk_no * chunksize + len(chunk), lencorpus))
+
+                # get the corresponding covariate values
+                doc_covariates = self.covariates[doc_indices]
+                word_covariates = self.yvarlevels[doc_indices]
+
+                gammat = self.do_estep(chunk, other, doc_covariates, word_covariates)
 
                 if self.optimize_alpha:
                     self.update_alpha(gammat, rho())
@@ -677,10 +697,11 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
                 # perform an M step. determine when based on update_every, don't do this after every chunk
                 if update_every and (chunk_no + 1) % (update_every) == 0:
-                    self.do_mstep(rho(), other, pass_ > 0)
+                    self.do_mstep(rho(), other, pass_ > 0, doc_covariates, word_covariates)
                     del other  # frees up memory
                     other = StmState(self.eta, self.state.sstats.shape, self.dtype)
                     dirty = False
+                    dirty_doc_indices = doc_indices  # store the current indices in case dirty
 
             if reallen != lencorpus:
                 raise RuntimeError("input corpus size changed during training (don't use generators as input)")
@@ -692,8 +713,11 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                     self.metrics[metric].append(value)
 
             if dirty:
+                # get the covariates for the "dirty" documents
+                dirty_doc_covariates = self.covariates[dirty_doc_indices]
+                dirty_word_covariates = self.yvarlevels[dirty_doc_indices]
                 # finish any remaining updates
-                self.do_mstep(rho(), other, pass_ > 0)
+                self.do_mstep(rho(), other, pass_ > 0, dirty_doc_covariates, dirty_word_covariates)
                 del other
                 dirty = False
 
