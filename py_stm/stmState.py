@@ -10,7 +10,7 @@ class StmState(utils.SaveLoad):
     
     May be sent over network so keep lightweight.
     """
-    def __init__(self, eta, shape, dtype=np.float32):
+    def __init__(self, beta, shape, dtype=np.float32):
         """
         Parameters
         ----------
@@ -21,7 +21,9 @@ class StmState(utils.SaveLoad):
         dtype : type
             Overrides the numpy array default types.
         """
-        self.eta = eta.astype(dtype, copy=False)
+        # TODO: dtype
+        dtype=np.int64
+        # self.beta = beta.astype(dtype, copy=False)
         self.sstats = np.zeros(shape, dtype=dtype)
         self.numdocs = 0
         self.dtype = dtype
@@ -120,7 +122,7 @@ class StmState(utils.SaveLoad):
             Parameters of the posterior probability over topics.
 
         """
-        return self.eta + self.sstats
+        return self.beta + self.sstats
 
     def get_Elogbeta(self):
         """Get the log (posterior) probabilities for each topic.

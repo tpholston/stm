@@ -1,37 +1,43 @@
 import logging
 import time
-import numbers
 import os
 import numpy as np
 from patsy import ModelDesc, dmatrix
 import pandas as pd
 from collections import defaultdict
+from operator import itemgetter
 
-from scipy.sparse import issparse
-from scipy.special import gammaln
+from scipy.sparse import csr_matrix
+from scipy.special import logsumexp
 from scipy.linalg import cholesky
+from scipy.stats import rankdata
 
 from gensim.models import basemodel, CoherenceModel
 from gensim import interfaces
 from gensim.matutils import (
-    dirichlet_expectation, mean_absolute_difference, logsumexp, argsort,
-    kullback_leibler, jensen_shannon, jaccard_distance, hellinger
+    argsort, kullback_leibler, jensen_shannon, jaccard_distance, hellinger
 )
 import gensim.utils as gensim_utils
 from gensim.models.callbacks import Callback
 
+from sklearn.linear_model import Lasso, Ridge, LinearRegression, PoissonRegressor
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import make_pipeline
+
 logger = logging.getLogger(__name__)
+
 from .stmState import StmState
 from . import utils
 
 class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
     def __init__(self, corpus=None, num_topics=100, id2word=None, 
                  metadata=None, prevalence=None, content=None,
-                 chunksize=2000, passes=1, update_every=1,
-                 alpha='symmetric', eta=None, decay=0.5, offset=1.0, eval_every=10,
-                 iterations=50, gamma_threshold=0.001, minimum_probability=0.01,
-                 random_state=None, minimum_phi_value=0.01,
-                 per_word_topics=False, callbacks=None, dtype=np.float32):
+                 chunksize=2000, passes=1, update_every=0,
+                 decay=0.5, offset=1.0, eval_every=10, minimum_probability=0.01,
+                 random_state=None, minimum_phi_value=0.01, per_word_topics=False, 
+                 callbacks=None, dtype=np.float32, init_mode="Spectral", 
+                 max_vocab=5000, interactions=True, convergence_threshold=1e-5, 
+                 LDAbeta=True, sigma_prior=0, model="STM", gamma_prior="L1"):
         """
 
         Parameters
@@ -61,24 +67,6 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         update_every : int, optional
             Number of documents to be iterated through for each update.
             Set to 0 for batch learning, > 1 for online iterative learning.
-        alpha : {float, numpy.ndarray of float, list of float, str}, optional
-            A-priori belief on document-topic distribution, this can be:
-                * scalar for a symmetric prior over document-topic distribution,
-                * 1D array of length equal to num_topics to denote an asymmetric user defined prior for each topic.
-
-            Alternatively default prior selecting strategies can be employed by supplying a string:
-                * 'symmetric': (default) Uses a fixed symmetric prior of `1.0 / num_topics`,
-                * 'asymmetric': Uses a fixed normalized asymmetric prior of `1.0 / (topic_index + sqrt(num_topics))`,
-                * 'auto': Learns an asymmetric prior from the corpus (not available if `distributed==True`).
-        eta : {float, numpy.ndarray of float, list of float, str}, optional
-            A-priori belief on topic-word distribution, this can be:
-                * scalar for a symmetric prior over topic-word distribution,
-                * 1D array of length equal to num_words to denote an asymmetric user defined prior for each word,
-                * matrix of shape (num_topics, num_words) to assign a probability for each word-topic combination.
-
-            Alternatively default prior selecting strategies can be employed by supplying a string:
-                * 'symmetric': (default) Uses a fixed symmetric prior of `1.0 / num_topics`,
-                * 'auto': Learns an asymmetric prior from the corpus.
         decay : float, optional
             A number between (0.5, 1] to weight what percentage of the previous lambda value is forgotten
             when each new document is examined.
@@ -88,10 +76,6 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             Corresponds to :math:`\\tau_0` from `'Online Learning for LDA' by Hoffman et al.`_
         eval_every : int, optional
             Log perplexity is estimated every that many updates. Setting this to one slows down training by ~2x.
-        iterations : int, optional
-            Maximum number of iterations through the corpus when inferring the topic distribution of a corpus.
-        gamma_threshold : float, optional
-            Minimum change in the value of the gamma parameters to continue iterating.
         minimum_probability : float, optional
             Topics with a probability lower than this threshold will be filtered out.
         random_state : {np.random.RandomState, int}, optional
@@ -105,8 +89,9 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             Metric callbacks to log and visualize evaluation metrics of the model during training.
         dtype : {numpy.float16, numpy.float32, numpy.float64}, optional
             Data-type to use during calculations inside model. All inputs are also converted.
-
+        init_mode: TODO:
         """
+
         self.dtype = np.finfo(dtype).dtype
 
         # store user-supplied parameters
@@ -135,6 +120,29 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         self.minimum_probability = minimum_probability
         self.num_updates = 0
 
+        # TODO: these are added. Get rid of unused instance vars
+        # TODO: interactions comment
+        # TODO: LDAbeta comment
+        # TODO: sigma_prior comment
+        # TODO: content comment
+        # TODO: prevalence comment
+        # TODO: max_vocab comment
+        # TODO: init_mode comment
+        # TODO: convergence_threshold comment
+        # TODO: model comment
+        # TODO: gamma_prior comment
+        self.interactions = interactions
+        self.init_mode = init_mode
+        self.max_vocab = max_vocab
+        self.LDAbeta = LDAbeta
+        self.last_bounds = []
+        self.content = content
+        self.prevalence = prevalence
+        self.sigma_prior = sigma_prior
+        self.convergence_threshold = convergence_threshold
+        self.model = model
+        self.mode = gamma_prior
+
         self.passes = passes
         self.update_every = update_every
         self.eval_every = eval_every
@@ -143,153 +151,156 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         self.callbacks = callbacks
 
         # covariates TODO: PLEASE TEST
-        if prevalence is not None:
-            self.covariates = utils.make_top_matrix(prevalence, metadata)
-            if np.isnan(np.count_nonzero(self.covariates)):
-                raise ValueError("Missing values in prevalence covariates.")
+        if self.prevalence is not None:
+            self.covariates = self.prevalence
         else:
+            self.model = "CTM"
             self.covariates = None
 
-        if content is not None:
-            if isinstance(content, str):
-                desc = ModelDesc.from_formula(content)
-                if desc.lhs_termlist != []:
-                    raise ValueError("Response variables should not be included in the content formula.")
-                if len(desc.rhs_termlist) != 2:
-                    raise ValueError("Currently, content can only contain one variable.")
-                yvar = dmatrix(content, data=metadata, return_type='dataframe')
-                yvar_categorical = pd.Categorical(yvar.iloc[:, 0])  # assuming yvar is a DataFrame with a single column
-                self.yvarlevels = yvar_categorical.categories.tolist()
-                self.betaindex = yvar_categorical.codes
+        if self.content is not None:
+            self.LDAbeta = False
+            if isinstance(content, pd.Series): #TODO: ensure this is 1d array
+                yvar = content.astype("category")
+                self.yvarlevels = set(yvar)
+                self.betaindex = np.array(yvar.cat.codes)
             else:
-                raise ValueError("Invalid content parameter. Expected formula (str).")
+                raise ValueError("Content needs to be type pd.DataFrame. Currently, content can only be one column.")
             
             if yvar.isnull().any().any():
                 raise ValueError("Your content covariate contains missing values. All values of the content covariate must be observed.")
         else:
             self.yvarlevels = None
-            self.betaindex = np.ones(len(metadata))
-
-        # hyperparams
-
-        self.alpha, self.optimize_alpha = self.init_dir_prior(alpha, 'alpha')
-        assert self.alpha.shape == (self.num_topics,), \
-            "Invalid alpha shape. Got shape %s, but expected (%d, )" % (str(self.alpha.shape), self.num_topics)
-
-        self.eta, self.optimize_eta = self.init_dir_prior(eta, 'eta')
-        assert self.eta.shape == (self.num_terms,) or self.eta.shape == (self.num_topics, self.num_terms), (
-            "Invalid eta shape. Got shape %s, but expected (%d, 1) or (%d, %d)" %
-            (str(self.eta.shape), self.num_terms, self.num_topics, self.num_terms))
+            self.betaindex = np.ones(len(corpus)) # TODO: this needs to be moved. 
+            self.interactions = False
 
         self.random_state = gensim_utils.get_random_state(random_state)
-
-        # VB constants
-        self.iterations = iterations
-        self.gamma_threshold = gamma_threshold
 
         logger.info("using serial STM version on this node")
 
         # Initialize the variational distribution q(beta|lambda)
         # TODO: modify this component depending on what we figure out in the inference()
-        self.state = StmState(self.eta, (self.num_topics, self.num_terms), dtype=self.dtype)
-        self.state.sstats[...] = self.random_state.gamma(100., 1. / 100., (self.num_topics, self.num_terms))
-        self.expElogbeta = np.exp(dirichlet_expectation(self.state.sstats))
-
-        # Check that we haven't accidentally fallen back to np.float64
-        assert self.eta.dtype == self.dtype
-        assert self.expElogbeta.dtype == self.dtype
+        # self.state.sstats[...] = self.random_state.gamma(100., 1. / 100., (self.num_topics, self.num_terms))
+        # self.expElogbeta = np.exp(dirichlet_expectation(self.state.sstats))
 
         # if a training corpus was provided, start estimating the model right away
         if corpus is not None:
+            try:
+                self.lencorpus = len(corpus)
+            except Exception:
+                logger.warning("input corpus stream has no len(); counting documents")
+                self.lencorpus = sum(1 for _ in corpus)
+            if self.lencorpus == 0:
+                logger.warning("StmModel called with an empty corpus")
+                return
+
             start = time.time()
+
+            # hyperparams
+            self.init_priors(corpus, self.init_mode, self.max_vocab)
+            self.state = StmState(self.beta, (self.num_topics, self.num_terms), dtype=self.dtype)
+
             self.update(corpus)
             self.add_lifecycle_event(
-                "created",
-                msg=f"trained {self} in {time.time() - start:.2f}s",
+                "created", msg=f"trained {self} in {time.time() - start:.2f}s",
             )
 
-    def init_dir_prior(self, prior, name):
-        """Initialize priors for the Dirichlet distribution.
+    def init_priors(self, corpus, init_mode, max_vocab):
+        """
+        Initialize priors for the Structural Topic Model.
+
+        Depending on the initialization mode specified, this method initializes the necessary priors
+        such as beta, mu, sigma, lambda, and theta.
 
         Parameters
         ----------
-        prior : {float, numpy.ndarray of float, list of float, str}
-            A-priori belief on document-topic distribution. If `name` == 'alpha', then the prior can be:
-                * scalar for a symmetric prior over document-topic distribution,
-                * 1D array of length equal to num_topics to denote an asymmetric user defined prior for each topic.
-
-            Alternatively default prior selecting strategies can be employed by supplying a string:
-                * 'symmetric': (default) Uses a fixed symmetric prior of `1.0 / num_topics`,
-                * 'asymmetric': Uses a fixed normalized asymmetric prior of `1.0 / (topic_index + sqrt(num_topics))`,
-                * 'auto': Learns an asymmetric prior from the corpus (not available if `distributed==True`).
-
-            A-priori belief on topic-word distribution. If `name` == 'eta' then the prior can be:
-                * scalar for a symmetric prior over topic-word distribution,
-                * 1D array of length equal to num_words to denote an asymmetric user defined prior for each word,
-                * matrix of shape (num_topics, num_words) to assign a probability for each word-topic combination.
-
-            Alternatively default prior selecting strategies can be employed by supplying a string:
-                * 'symmetric': (default) Uses a fixed symmetric prior of `1.0 / num_topics`,
-                * 'auto': Learns an asymmetric prior from the corpus.
-        name : {'alpha', 'eta'}
-            Whether the `prior` is parameterized by the alpha vector (1 parameter per topic)
-            or by the eta (1 parameter per unique term in the vocabulary).
+        corpus : iterable of list of (int, float)
+            Stream of document vectors or sparse matrix of shape (`num_documents`, `num_terms`).
+        init_mode : str
+            The initialization mode to use. Possible values: 'LDA', 'Random', or 'Spectral'.
+        max_vocab : int
+            Maximum number of top words to select based on probabilities for spectral initialization.
 
         Returns
         -------
-        init_prior: numpy.ndarray
-            Initialized Dirichlet prior:
-            If 'alpha' was provided as `name` the shape is (self.num_topics, ).
-            If 'eta' was provided as `name` the shape is (len(self.id2word), ).
-        is_auto: bool
-            Flag that shows if hyperparameter optimization should be used or not.
+        None
+            The method initializes the priors of the Structural Topic Model object.
         """
-        if prior is None:
-            prior = 'symmetric'
+        if init_mode is None:
+            init_mode = 'Spectral'
 
-        if name == 'alpha':
-            prior_shape = self.num_topics
-        elif name == 'eta':
-            prior_shape = self.num_terms
-        else:
-            raise ValueError("'name' must be 'alpha' or 'eta'")
+        if init_mode == 'LDA':
+            init_beta = self.lda_init()
+            # TODO: init other params for LDA mode
+        elif init_mode == 'Random':
+            init_beta = self.random_init()
+            # TODO: init other params for Random mode 
+        elif init_mode == 'Spectral':
+            doc_id, word_id, word_freq = [], [], []
+            for i, doc in enumerate(corpus):
+                for word, freq in doc:
+                    doc_id.append(i)
+                    word_id.append(word)
+                    word_freq.append(freq)
 
-        is_auto = False
+            doc_word_freq = csr_matrix((word_freq, (doc_id, word_id)))
+            self.wcounts = np.array(doc_word_freq.sum(axis=0)).flatten()
 
-        if isinstance(prior, str):
-            if prior == 'symmetric':
-                logger.info("using symmetric %s at %s", name, 1.0 / self.num_topics)
-                init_prior = np.fromiter(
-                    (1.0 / self.num_topics for i in range(prior_shape)),
-                    dtype=self.dtype, count=prior_shape,
-                )
-            elif prior == 'asymmetric':
-                if name == 'eta':
-                    raise ValueError("The 'asymmetric' option cannot be used for eta")
-                init_prior = np.fromiter(
-                    (1.0 / (i + np.sqrt(prior_shape)) for i in range(prior_shape)),
-                    dtype=self.dtype, count=prior_shape,
-                )
-                init_prior /= init_prior.sum()
-                logger.info("using asymmetric %s %s", name, list(init_prior))
-            elif prior == 'auto':
-                is_auto = True
-                init_prior = np.fromiter((1.0 / self.num_topics for i in range(prior_shape)),
-                    dtype=self.dtype, count=prior_shape)
-                if name == 'alpha':
-                    logger.info("using autotuned %s, starting with %s", name, list(init_prior))
-            else:
-                raise ValueError("Unable to determine proper %s value given '%s'" % (name, prior))
-        elif isinstance(prior, list):
-            init_prior = np.asarray(prior, dtype=self.dtype)
-        elif isinstance(prior, np.ndarray):
-            init_prior = prior.astype(self.dtype, copy=False)
-        elif isinstance(prior, (np.number, numbers.Real)):
-            init_prior = np.fromiter((prior for i in range(prior_shape)), dtype=self.dtype)
-        else:
-            raise ValueError("%s must be either a np array of scalars, list of scalars, or scalar" % name)
+            self.beta = self.spectral_init(doc_word_freq, max_vocab)
+            self.mu = np.zeros((self.lencorpus, self.num_topics - 1))
+            self.sigma = np.zeros(((self.num_topics - 1), (self.num_topics - 1)))
+            np.fill_diagonal(self.sigma, 20)
+            self.lambda_ = np.zeros((self.lencorpus, self.num_topics - 1))
+            self.theta = np.zeros((self.lencorpus, self.num_topics))
+            
+    def spectral_init(self, doc_word_freq, max_vocab):
+        """
+        Perform spectral initialization.
 
-        return init_prior, is_auto
+        Given a document-term frequency matrix, this method computes the gram matrix, selects anchor words,
+        and recovers the L2 matrix. It then constructs beta values for each aspect based on the selected top words.
+
+        Parameters
+        ----------
+        doc_word_freq : numpy.ndarray
+            Document-term frequency matrix.
+        max_vocab : int
+            Maximum number of top words to select based on probabilities.
+
+        Returns
+        -------
+        numpy.ndarray
+            Beta values representing the topic-word distributions for each aspect.
+        """
+        # Compute word probabilities
+        word_probabilities = np.sum(doc_word_freq, axis=0)
+        word_probabilities = word_probabilities / np.sum(word_probabilities)
+        word_probabilities = np.array(word_probabilities).flatten()
+
+        # Select top words based on probabilities
+        top_words_indices = np.argsort(-1 * word_probabilities)[:max_vocab]
+        doc_word_freq = doc_word_freq[:, top_words_indices]
+        word_probabilities = word_probabilities[top_words_indices]
+
+        # Prepare the Gram matrix
+        gram_matrix = utils.compute_gram_matrix(doc_word_freq)
+
+        # Compute anchor words
+        anchor_words = utils.fast_anchor(gram_matrix, self.num_topics)
+
+        # Recover L2
+        recovered_beta = utils.recover_l2(gram_matrix, anchor_words, word_probabilities)
+
+        if top_words_indices is not None:
+            updated_beta = np.zeros(self.num_topics * len(self.id2word)).reshape(self.num_topics, len(self.id2word))
+            updated_beta[:, top_words_indices] = recovered_beta
+            updated_beta += 0.001 / len(self.id2word)
+            recovered_beta = updated_beta / np.sum(updated_beta)
+
+        # Create a list of beta values for each aspect
+        if self.interactions:
+            recovered_beta = np.array([recovered_beta.copy() for _ in set(self.betaindex)])
+
+        return recovered_beta
 
     def __str__(self):
         """Get a string representation of the current object.
@@ -300,31 +311,18 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             Human readable representation of the most important model parameters.
 
         """
-        return "%s<num_terms=%s, num_topics=%s, decay=%s, chunksize=%s>" % (
-            self.__class__.__name__, self.num_terms, self.num_topics, self.decay, self.chunksize
+        return "%s<num_terms=%s, num_topics=%s, chunksize=%s>" % (
+            self.__class__.__name__, self.num_terms, self.num_topics, self.chunksize
         )
 
-    def sync_state(self, current_Elogbeta=None):
-        """Propagate the states topic probabilities to the inner object's attribute.
-
-        Parameters
-        ----------
-        current_Elogbeta: numpy.ndarray
-            Posterior probabilities for each topic, optional.
-            If omitted, it will get Elogbeta from state.
-
+    # TODO: modify function comment. STATE
+    def inference(self, chunk, mu, betaindex, lambda_, theta, beta_ss, sigma_ss, collect_sstats=False):
         """
-        if current_Elogbeta is None:
-            current_Elogbeta = self.state.get_Elogbeta()
-        self.expElogbeta = np.exp(current_Elogbeta)
-        assert self.expElogbeta.dtype == self.dtype
-
-    def inference(self, chunk, collect_sstats=False, doc_covaraites=None, word_covariates=None):
-        """Given a chunk of sparse document vectors, estimate gamma (parameters controlling the topic weights)
+        Given a chunk of sparse document vectors, estimate gamma (parameters controlling the topic weights)
         for each document in the chunk.
 
-        This function does not modify the model. The whole input chunk of document is assumed to fit in RAM;
-        chunking of a large corpus must be done earlier in the pipeline. Avoids computing the `phi` variational
+        This function does not modify the model. The whole input chunk of documents is assumed to fit in RAM;
+        chunking of a large corpus must be done earlier in the pipeline. It avoids computing the `phi` variational
         parameter directly using the optimization presented in
         `Lee, Seung: Algorithms for non-negative matrix factorization"
         <https://papers.nips.cc/paper/1861-algorithms-for-non-negative-matrix-factorization.pdf>`_.
@@ -336,100 +334,121 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         collect_sstats : bool, optional
             If set to True, also collect (and return) sufficient statistics needed to update the model's topic-word
             distributions.
-        doc_covariates : ndarray, optional
-            Document-level covariates, shape (`len(chunk)`,).
-        word_covariates : ndarray, optional
-            Word-level covariates, shape (`len(chunk)`,).
 
         Returns
         -------
-        (numpy.ndarray, {numpy.ndarray, None})
-            The first element is always returned and it corresponds to the states gamma matrix. The second element is
-            only returned if `collect_sstats` == True and corresponds to the sufficient statistics for the M step.
-
+        (numpy.ndarray, numpy.ndarray)
+            The first element is always returned and it corresponds to the beta_ss matrix. The second element corresponds to
+            the sigma_ss matrix and is only returned if `collect_sstats` == True.
         """
         try:
             len(chunk)
         except TypeError:
             # convert iterators/generators to plain list, so we have len() etc.
             chunk = list(chunk)
+
         if len(chunk) > 1:
-            logger.debug("performing inference on a chunk of %i documents", len(chunk))
+            logger.debug("Performing inference on a chunk of %i documents", len(chunk))
 
-        # Initialize the variational distribution q(theta|gamma) for the chunk
-        gamma = self.random_state.gamma(100., 1. / 100., (len(chunk), self.num_topics)).astype(self.dtype, copy=False)
-        Elogtheta = dirichlet_expectation(gamma)
-        expElogtheta = np.exp(Elogtheta)
+        # Precalculate common components
+        while True:
+            try:
+                sigobj = np.linalg.cholesky(self.sigma)
+                self.sigma_entropy = np.sum(np.log(np.diag(sigobj)))
+                self.sigma_inv = np.linalg.inv(sigobj).T * np.linalg.inv(sigobj)
+                break
+            except:
+                logger.error("Cholesky Decomposition failed because Sigma is not positive definite.")
+                self.sigma_entropy = 0.5 * np.linalg.slogdet(self.sigma)[1]  # part 2 of ELBO
+                self.sigma_inv = cholesky(self.sigma)  # part 3 of ELBO
 
-        assert Elogtheta.dtype == self.dtype
-        assert expElogtheta.dtype == self.dtype
+        # Initialize sufficient statistics
+        calculated_bounds = []
 
-        if collect_sstats:
-            sstats = np.zeros_like(self.expElogbeta, dtype=self.dtype)
-        else:
-            sstats = None
-        converged = 0
-
-        # Now, for each document d update that document's gamma and phi
-        # Inference code copied from Hoffman's `onlineldavb.py` (esp. the
-        # Lee&Seung trick which speeds things up by an order of magnitude, compared
-        # to Blei's original LDA-C code, cool!).
+        start_time = time.time()
+        # For each document d, update gamma and phi
         integer_types = (int, np.integer,)
-        epsilon = np.finfo(self.dtype).eps
+        # epsilon = np.finfo(self.dtype).eps
         for d, doc in enumerate(chunk):
             if len(doc) > 0 and not isinstance(doc[0][0], integer_types):
-                # make sure the term IDs are ints, otherwise np will get upset
+                # Make sure the term IDs are ints; otherwise, np will raise an error
                 ids = [int(idx) for idx, _ in doc]
             else:
                 ids = [idx for idx, _ in doc]
             cts = np.fromiter((cnt for _, cnt in doc), dtype=self.dtype, count=len(doc))
-            gammad = gamma[d, :]
-            Elogthetad = Elogtheta[d, :]
-            expElogthetad = expElogtheta[d, :]
-            expElogbetad = self.expElogbeta[:, ids]
 
-            # The optimal phi_{dwk} is proportional to expElogthetad_k * expElogbetad_kw.
-            # phinorm is the normalizer.
-            # TODO treat zeros explicitly, instead of adding epsilon?
-            phinorm = np.dot(expElogthetad, expElogbetad) + epsilon
+            aspect = betaindex[d] if self.content is not None else None
 
-            # Iterate between gamma and phi until convergence
-            for _ in range(self.iterations):
-                lastgamma = gammad
-                # We represent phi implicitly to save memory and time.
-                # Substituting the value of the optimal phi back into
-                # the update for gamma gives this update. Cf. Lee&Seung 2001.
-                gammad = self.alpha + expElogthetad * np.dot(cts / phinorm, expElogbetad.T)
-                Elogthetad = dirichlet_expectation(gammad)
-                expElogthetad = np.exp(Elogthetad)
-                phinorm = np.dot(expElogthetad, expElogbetad) + epsilon
-                # If gamma hasn't changed much, we're done.
-                meanchange = mean_absolute_difference(gammad, lastgamma)
-                if meanchange < self.gamma_threshold:
-                    converged += 1
-                    break
-            gamma[d, :] = gammad
-            assert gammad.dtype == self.dtype
-            if collect_sstats:
-                # Contribution of document d to the expected sufficient
-                # statistics for the M step.
-                sstats[:, ids] += np.outer(expElogthetad.T, cts / phinorm)
+            beta_doc_kv = self.get_topic_word_distribution(ids, aspect=aspect)
+            
+            assert np.all(beta_doc_kv >= 0), "Some entries of beta are negative or NaN."
 
-        if len(chunk) > 1:
-            logger.debug("%i/%i documents converged within %i iterations", converged, len(chunk), self.iterations)
+            res = utils.optimize_lambda(
+                num_topics=self.num_topics,
+                lambda_=lambda_[d],
+                mu=mu[d],
+                word_count=cts,
+                beta_doc=beta_doc_kv,
+                sigma_inv=self.sigma_inv,
+            )
 
-        if collect_sstats:
-            # This step finishes computing the sufficient statistics for the
-            # M step, so that
-            # sstats[k, w] = \sum_d n_{dw} * phi_{dwk}
-            # = \sum_d n_{dw} * exp{Elogtheta_{dk} + Elogbeta_{kw}} / phinorm_{dw}.
-            sstats *= self.expElogbeta
-            assert sstats.dtype == self.dtype
+            lambda_[d] = res.x
+            theta[d] = np.exp(np.insert(res.x, self.num_topics - 1, 0)) / np.sum(
+                np.exp(np.insert(res.x, self.num_topics - 1, 0))
+            )
 
-        assert gamma.dtype == self.dtype
-        return gamma, sstats
+            # Compute Hessian, Phi, and Lower Bound
+            hess_i = utils.hessian(
+                num_topics=self.num_topics,
+                lambda_=lambda_[d], 
+                word_count=cts, 
+                topic_word_distribution=beta_doc_kv,
+                sigma_inv=self.sigma_inv,
+            )
+            L_i = utils.decompose_hessian(hess_i)
 
-    def do_estep(self, chunk, state=None, doc_covariates=None, word_covariates=None):
+            bound_i = utils.lower_bound(
+                num_topics=self.num_topics,
+                L=L_i,
+                mu=mu[d],
+                word_count=cts,
+                topic_word_distribution=beta_doc_kv,
+                lambda_=lambda_[d],
+                sigma_inv=self.sigma_inv,
+                sigma_entropy=self.sigma_entropy,
+            )
+
+            nu = utils.optimize_nu(L_i)
+
+            self.phi = utils.update_z(
+                num_topics = self.num_topics,
+                lambda_=lambda_[d],
+                topic_word_distribution=beta_doc_kv,
+                word_count=cts,
+            )
+
+            calculated_bounds.append(bound_i)
+
+            # Update sufficient statistics
+            sigma_ss += nu
+            if self.interactions:
+                beta_ss[aspect][:, np.array(np.int64(ids))] += self.phi
+            else:
+                try:
+                    beta_ss[:, np.array(np.int64(ids))] += self.phi
+                except RuntimeWarning:
+                    breakpoint()
+
+        self.bound = np.sum(calculated_bounds)
+        self.last_bounds.append(self.bound)
+        elapsed_time = np.round((time.time() - start_time), 3)
+        logging.info(f"Lower Bound: {self.bound}")
+        logging.info(f"Completed E-Step in {elapsed_time} seconds.\n")
+
+        return beta_ss, sigma_ss, lambda_, theta
+
+    # TODO: modify function comment. STATE
+    def do_estep(self, chunk, mu, betaindex, lambda_, theta, beta_ss, sigma_ss, state=None):
         """Perform inference on a chunk of documents, and accumulate the collected sufficient statistics.
 
         Parameters
@@ -439,76 +458,48 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         state : :class:`~stm.StmState`, optional
             The state to be updated with the newly accumulated sufficient statistics. If none, the models
             `self.state` is updated.
-        doc_covariates : ndarray, optional
-            Document-level covariates, shape (`len(chunk)`,).
-        word_covariates : ndarray, optional
-            Word-level covariates, shape (`len(chunk)`,).
+        TODO:
 
         Returns
         -------
-        numpy.ndarray
-            Gamma parameters controlling the topic weights, shape (`len(chunk)`, `self.num_topics`).
-
+        (numpy.ndarray, numpy.ndarray)
+            The first element is always returned and it corresponds to the beta_ss matrix. The second element corresponds to
+            the sigma_ss matrix and is only returned if `collect_sstats` == True.
         """
         if state is None:
             state = self.state
-        gamma, sstats = self.inference(chunk, collect_sstats=True, doc_covariates=doc_covariates, word_covariates=word_covariates)
-        state.sstats += sstats
-        state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
-        assert gamma.dtype == self.dtype
-        return gamma
+        beta_ss, sigma_ss, lambda_, theta = self.inference(chunk, mu, betaindex, lambda_, theta, beta_ss, sigma_ss, collect_sstats=True)
+        # TODO: here we should be updating state and updating sstats
+        #state.sstats += sstats
+        #state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
+        #assert gamma.dtype == self.dtype
+        return beta_ss, sigma_ss, lambda_, theta
 
-    def update_alpha(self, gammat, rho):
-        """Update parameters for the Dirichlet prior on the per-document topic weights.
-
-        Parameters
-        ----------
-        gammat : numpy.ndarray
-            Previous topic weight parameters.
-        rho : float
-            Learning rate.
-
-        Returns
-        -------
-        numpy.ndarray
-            Sequence of alpha parameters.
-
+    def get_topic_word_distribution(self, words, aspect):
         """
-        N = float(len(gammat))
-        logphat = sum(dirichlet_expectation(gamma) for gamma in gammat) / N
-        assert logphat.dtype == self.dtype
+        Get the topic-word distribution for a document with the respective topical content covariate (aspect).
 
-        self.alpha = utils.update_dir_prior(self.alpha, N, logphat, rho)
-        logger.info("optimized alpha %s", list(self.alpha))
-
-        assert self.alpha.dtype == self.dtype
-        return self.alpha
-
-    def update_eta(self, lambdat, rho):
-        """Update parameters for the Dirichlet prior on the per-topic word weights.
-
-        Parameters
+        Parameters:
         ----------
-        lambdat : numpy.ndarray
-            Previous lambda parameters.
-        rho : float
-            Learning rate.
+        words : np.ndarray
+            1D-array with word indices for a specific document.
+        aspect : int or float
+            Topical content covariate for a specific document.
 
-        Returns
+        Returns:
         -------
-        numpy.ndarray
-            The updated eta parameters.
-
+        np.ndarray:
+            Topic-word distribution for a specific document, based on word indices and aspect.
         """
-        N = float(lambdat.shape[0])
-        logphat = (sum(dirichlet_expectation(lambda_) for lambda_ in lambdat) / N).reshape((self.num_terms,))
-        assert logphat.dtype == self.dtype
+        if self.interactions:
+            topic_word_distribution = self.beta[aspect][:, np.array(np.int64(words))]
+        else:
+            # TODO: I think the issue is here. Check beta len. Might need to be chunked
+            topic_word_distribution = self.beta[:, np.array(np.int64(words))]
 
-        self.eta = utils.update_dir_prior(self.eta, N, logphat, rho)
+        return topic_word_distribution
 
-        assert self.eta.dtype == self.dtype
-        return self.eta
-
+    # TODO: remove? Idk if this even works for STM
     def log_perplexity(self, chunk, total_docs=None):
         """Calculate and return per-word likelihood bound, using a chunk of documents as evaluation corpus.
 
@@ -539,8 +530,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         return perwordbound
 
     def update(self, corpus, chunksize=None, decay=None, offset=None,
-               passes=None, update_every=None, eval_every=None, iterations=None,
-               gamma_threshold=None):
+               passes=None, update_every=None, eval_every=None, convergence_threshold=None):
         """Train the model with new documents, by EM-iterating over the corpus until the topics converge, or until
         the maximum number of allowed iterations is reached. `corpus` must be an iterable.
 
@@ -579,10 +569,6 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             Set to 0 for batch learning, > 1 for online iterative learning.
         eval_every : int, optional
             Log perplexity is estimated every that many updates. Setting this to one slows down training by ~2x.
-        iterations : int, optional
-            Maximum number of iterations through the corpus when inferring the topic distribution of a corpus.
-        gamma_threshold : float, optional
-            Minimum change in the value of the gamma parameters to continue iterating.
         """
         # use parameters given in constructor, unless user explicitly overrode them
         if decay is None:
@@ -595,30 +581,33 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             update_every = self.update_every
         if eval_every is None:
             eval_every = self.eval_every
-        if iterations is None:
-            iterations = self.iterations
-        if gamma_threshold is None:
-            gamma_threshold = self.gamma_threshold
+        if convergence_threshold is None:
+            convergence_treshold = self.convergence_threshold
 
         try:
-            lencorpus = len(corpus)
+            self.lencorpus = len(corpus)
         except Exception:
             logger.warning("input corpus stream has no len(); counting documents")
-            lencorpus = sum(1 for _ in corpus)
-        if lencorpus == 0:
+            self.lencorpus = sum(1 for _ in corpus)
+        if self.lencorpus == 0:
             logger.warning("StmModel.update() called with an empty corpus")
             return
-
+        
+        # if corpus wan't provided in class constructor
+        if self.beta is None:
+            self.beta, self.mu, self.sigma, self.lambda_, self.theta = self.init_priors(self.corpus, self.init_mode, self.max_vocab)
+            self.state = StmState(self.beta, (self.num_topics, self.num_terms), dtype=self.dtype)
+            
         # Checks for Dimension agreement
         ny = len(self.betaindex)
-        nx = self.covariates.shape[0] if self.covariates is not None else lencorpus
-        if( lencorpus != nx or lencorpus != ny):
-            raise ValueError(f"Number of observations in content covariate ({ny}) prevalence covariate ({nx}) and documents ({lencorpus}) are not all equal.")
+        nx = self.covariates.shape[0] if self.covariates is not None else self.lencorpus
+        if( self.lencorpus != nx or self.lencorpus != ny):
+            raise ValueError(f"Number of observations in content covariate ({ny}) prevalence covariate ({nx}) and documents ({self.lencorpus}) are not all equal.")
 
         if chunksize is None:
-            chunksize = min(lencorpus, self.chunksize)
+            chunksize = min(self.lencorpus, self.chunksize)
 
-        self.state.numdocs += lencorpus
+        self.state.numdocs += self.lencorpus
 
         if update_every:
             updatetype = "online"
@@ -626,21 +615,20 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                 updatetype += " (single-pass)"
             else:
                 updatetype += " (multi-pass)"
-            updateafter = min(lencorpus, update_every * chunksize)
+            updateafter = min(self.lencorpus, update_every * chunksize)
         else:
             updatetype = "batch"
-            updateafter = lencorpus
-        evalafter = min(lencorpus, (eval_every or 0) * chunksize)
+            updateafter = self.lencorpus
+        evalafter = min(self.lencorpus, (eval_every or 0) * chunksize)
 
-        updates_per_pass = max(1, lencorpus / updateafter)
+        updates_per_pass = max(1, self.lencorpus / updateafter)
         logger.info(
             "running %s STM training, %s topics, %i passes over "
             "the supplied corpus of %i documents, updating model once "
             "every %i documents, evaluating perplexity every %i documents, "
-            "iterating %ix with a convergence threshold of %f",
-            updatetype, self.num_topics, passes, lencorpus,
-            updateafter, evalafter, iterations,
-            gamma_threshold
+            "with a convergence threshold of %f",
+            updatetype, self.num_topics, passes, self.lencorpus,
+            updateafter, evalafter, convergence_threshold
         )
 
         if updates_per_pass * passes < 10:
@@ -649,12 +637,6 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                 "consider increasing the number of passes or iterations to improve accuracy"
             )
 
-        # rho is the "speed" of updating; TODO try other fncs
-        # pass_ + num_updates handles increasing the starting t for each pass,
-        # while allowing it to "reset" on the first pass of each update
-        def rho():
-            return pow(offset + pass_ + (self.num_updates / chunksize), -decay)
-
         if self.callbacks:
             # pass the list of input callbacks to Callback class
             callback = Callback(self.callbacks)
@@ -662,48 +644,71 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             # initialize metrics list to store metric values after every epoch
             self.metrics = defaultdict(list)
 
+        converged = False
+        first_start_time = time.time()
         for pass_ in range(passes):
-            other = StmState(self.eta, self.state.sstats.shape, self.dtype)
+            other = StmState(self.beta, self.state.sstats.shape, self.dtype)
             dirty = False
 
             reallen = 0
             chunks = gensim_utils.grouper(corpus, chunksize, dtype=self.dtype)
+
+            sigma_ss = np.zeros(shape=self.sigma.shape)
+            beta_ss = np.zeros(shape=self.beta.shape)
+
             for chunk_no, chunk in enumerate(chunks):
                 reallen += len(chunk)  # keep track of how many documents we've processed so far
 
-                if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every) == 0)):
-                    self.log_perplexity(chunk, total_docs=lencorpus)
+                # TODO: logging perplexity is probably an important option here
+                #if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every) == 0)):
+                #    self.log_perplexity(chunk, total_docs=lencorpus)
 
                 logger.info(
                     "PROGRESS: pass %i, at document #%i/%i",
-                    pass_, chunk_no * chunksize + len(chunk), lencorpus
+                    pass_, chunk_no * chunksize + len(chunk), self.lencorpus
                 )
 
                 # get the document indices for this chunk
                 # TODO: go back to make sure this min() works effectively. Should only be relevant for dirty doc chunks.
-                doc_indices = range(chunk_no * chunksize, min(chunk_no * chunksize + len(chunk), lencorpus))
+                chunk_indices = range(chunk_no * chunksize, min(chunk_no * chunksize + len(chunk), self.lencorpus))
+                
+                chunk_mu = self.mu[chunk_indices]
+                chunk_betaindex = self.betaindex[chunk_indices]
+                chunk_lambda = self.lambda_[chunk_indices]
+                chunk_theta = self.theta[chunk_indices]
 
-                # get the corresponding covariate values
-                doc_covariates = self.covariates[doc_indices]
-                word_covariates = self.yvarlevels[doc_indices]
+                # print(chunk_mu.shape, self.mu.shape)
+                # print(chunk_lambda.shape, self.lambda_.shape, chunksize, chunk_no, len(chunk))
+                # print(chunk_betaindex.shape, self.betaindex.shape)
 
-                gammat = self.do_estep(chunk, other, doc_covariates, word_covariates)
+                beta_ss, sigma_ss, chunk_lambda, chunk_theta = self.do_estep(chunk, mu=chunk_mu, betaindex=chunk_betaindex, 
+                                                                             lambda_=chunk_lambda, theta=chunk_theta, beta_ss=beta_ss, sigma_ss=sigma_ss, state=other)
 
-                if self.optimize_alpha:
-                    self.update_alpha(gammat, rho())
+                # self.mu[chunk_indices] = chunk_mu
+                # self.betaindex[chunk_indices] = chunk_betaindex
+                self.lambda_[chunk_indices] = chunk_lambda
+                self.theta[chunk_indices] = chunk_theta
 
                 dirty = True
                 del chunk
 
                 # perform an M step. determine when based on update_every, don't do this after every chunk
                 if update_every and (chunk_no + 1) % (update_every) == 0:
-                    self.do_mstep(rho(), other, pass_ > 0, doc_covariates, word_covariates)
+                    self.do_mstep(other, beta_ss, sigma_ss, pass_ > 0)
                     del other  # frees up memory
-                    other = StmState(self.eta, self.state.sstats.shape, self.dtype)
+                    other = StmState(self.beta, self.state.sstats.shape, self.dtype)
                     dirty = False
-                    dirty_doc_indices = doc_indices  # store the current indices in case dirty
+                    # dirty_doc_indices = doc_indices  # store the current indices in case dirty
 
-            if reallen != lencorpus:
+            if self.is_converged(pass_):
+                converged = True
+                self.time_processed = time.time() - first_start_time
+                logging.info(
+                    f"model converged in iteration {pass_} after {self.time_processed}s"
+                )
+                break            
+
+            if reallen != self.lencorpus:
                 raise RuntimeError("input corpus size changed during training (don't use generators as input)")
 
             # append current epoch's metric values
@@ -714,109 +719,304 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
             if dirty:
                 # get the covariates for the "dirty" documents
-                dirty_doc_covariates = self.covariates[dirty_doc_indices]
-                dirty_word_covariates = self.yvarlevels[dirty_doc_indices]
+                # dirty_doc_covariates = self.covariates[dirty_doc_indices]
+                # dirty_word_covariates = self.yvarlevels[dirty_doc_indices]
                 # finish any remaining updates
-                self.do_mstep(rho(), other, pass_ > 0, dirty_doc_covariates, dirty_word_covariates)
+                self.do_mstep(other, beta_ss, sigma_ss, pass_ > 0)
                 del other
                 dirty = False
 
-    def do_mstep(self, rho, other, extra_pass=False):
+        if not converged:
+            self.time_processed = time.time() - first_start_time
+            logging.info(
+                f"maximum number of passes ({passes}) reached after {self.time_processed} seconds"
+            )
+
+    # TODO: modify
+    def do_mstep(self, other, beta_ss, sigma_ss, extra_pass=False):
         """Maximization step: use linear interpolation between the existing topics and
         collected sufficient statistics in `other` to update the topics.
 
         Parameters
         ----------
-        rho : float
-            Learning rate.
         other : :class:`~stm.StmModel`
             The model whose sufficient statistics will be used to update the topics.
+        beta_ss : np.ndarray
+            beta sufficicent statistics
+        sigma_ss : np.ndarray
+            sigma sufficient statistics
         extra_pass : bool, optional
             Whether this step required an additional pass over the corpus.
 
         """
         logger.debug("updating topics")
-        # update self with the new blend; also keep track of how much did
-        # the topics change through this update, to assess convergence
-        previous_Elogbeta = self.state.get_Elogbeta()
-        self.state.blend(rho, other)
-
-        current_Elogbeta = self.state.get_Elogbeta()
-        self.sync_state(current_Elogbeta)
-
-        # print out some debug info at the end of each EM iteration
-        self.print_topics(5)
-        diff = mean_absolute_difference(previous_Elogbeta.ravel(), current_Elogbeta.ravel())
-        logger.info("topic diff=%f, rho=%f", diff, rho)
-
-        if self.optimize_eta:
-            self.update_eta(self.state.get_lambda(), rho)
 
         if not extra_pass:
             # only update if this isn't an additional pass
             self.num_updates += other.numdocs
 
-    def bound(self, corpus, gamma=None, subsample_ratio=1.0):
-        """Estimate the variational bound of documents from the corpus as E_q[log p(corpus)] - E_q[log q(corpus)].
+        start_time = time.time()
 
-        Parameters
-        ----------
-        corpus : iterable of list of (int, float), optional
-            Stream of document vectors or sparse matrix of shape (`num_documents`, `num_terms`) used to estimate the
-            variational bounds.
-        gamma : numpy.ndarray, optional
-            Topic weight variational parameters for each document. If not supplied, it will be inferred from the model.
-        subsample_ratio : float, optional
-            Percentage of the whole corpus represented by the passed `corpus` argument (in case this was a sample).
-            Set to 1.0 if the whole corpus was passed.This is used as a multiplicative factor to scale the likelihood
-            appropriately.
+        self.update_mu()
 
-        Returns
-        -------
-        numpy.ndarray
-            The variational bound score calculated for each document.
+        self.update_sigma(nu=sigma_ss)
 
+        self.update_beta(beta_ss)
+
+        logging.info(f"Completed M-Step in {np.round((time.time() - start_time), 3)} seconds. \n")
+
+    def update_mu(self, intercept=True):
         """
-        score = 0.0
-        _lambda = self.state.get_lambda()
-        Elogbeta = dirichlet_expectation(_lambda)
+        Update the mean parameter for the document-specific logistic normal distribution.
 
-        for d, doc in enumerate(corpus):  # stream the input doc-by-doc, in case it's too large to fit in RAM
-            if d % self.chunksize == 0:
-                logger.debug("bound: at document #%i", d)
-            if gamma is None:
-                gammad, _ = self.inference([doc])
-            else:
-                gammad = gamma[d]
-            Elogthetad = dirichlet_expectation(gammad)
+        Parameters:
+        ----------
+        intercept : bool, optional
+            Whether or not an intercept is included in the model.
 
-            assert gammad.dtype == self.dtype
-            assert Elogthetad.dtype == self.dtype
+        Raises:
+        -------
+        ValueError:
+            If the model is not "CTM", "STM", or if the mode is not specified correctly.
+        """
+        if self.model == "CTM":
+            # Use the mean for all documents
+            self.mu = np.repeat(np.mean(self.lambda_, axis=0)[None, :], self.lencorpus, axis=0)
+            return
 
-            # E[log p(doc | theta, beta)]
-            score += sum(cnt * logsumexp(Elogthetad + Elogbeta[:, int(id)]) for id, cnt in doc)
+        try:
+            self.covariates = self.covariates.astype("category")
+        except:
+            pass
 
-            # E[log p(theta | alpha) - log q(theta | gamma)]; assumes alpha is a vector
-            score += np.sum((self.alpha - gammad) * Elogthetad)
-            score += np.sum(gammaln(gammad) - gammaln(self.alpha))
-            score += gammaln(np.sum(self.alpha)) - gammaln(np.sum(gammad))
+        prev_cov = np.array(self.covariates)[:, None]  # Prepare 1D array for one-hot encoding (OHE) by making it 2D
 
-        # Compensate likelihood for when `corpus` above is only a sample of the whole corpus. This ensures
-        # that the likelihood is always roughly on the same scale.
-        score *= subsample_ratio
+        # Remove empty dimension
+        if len(prev_cov.shape) > 2:
+            prev_cov = np.squeeze(prev_cov, axis=1)
 
-        # E[log p(beta | eta) - log q (beta | lambda)]; assumes eta is a scalar
-        score += np.sum((self.eta - _lambda) * Elogbeta)
-        score += np.sum(gammaln(_lambda) - gammaln(self.eta))
+        if not np.array_equal(prev_cov, prev_cov.astype(bool)):
+            enc = OneHotEncoder(handle_unknown="ignore")  # Create OHE
+            prev_cov = enc.fit_transform(prev_cov).toarray()  # Fit OHE
 
-        if np.ndim(self.eta) == 0:
-            sum_eta = self.eta * self.num_terms
+        if self.mode == "L1":
+            linear_model = Lasso(
+                alpha=1, fit_intercept=intercept
+            )
+            fitted_model = linear_model.fit(prev_cov, self.lambda_)
+
+        elif self.mode == "L2":
+            linear_model = Ridge(
+                alpha=0.1, fit_intercept=intercept
+            )
+            fitted_model = linear_model.fit(prev_cov, self.lambda_)
+
+        elif self.mode == "OLS":
+            linear_model = LinearRegression(
+                fit_intercept=intercept
+            )
+            fitted_model = linear_model.fit(prev_cov, self.lambda_)
         else:
-            sum_eta = np.sum(self.eta)
+            raise ValueError('Updating the topical prevalence parameter requires a mode. Choose from "L1", "L2", or "OLS".')
 
-        score += np.sum(gammaln(sum_eta) - gammaln(np.sum(_lambda, 1)))
+        # Adjust design matrix if intercept is estimated
+        if intercept:
+            self.gamma = np.column_stack((fitted_model.intercept_, fitted_model.coef_))
+            design_matrix = np.c_[np.ones(prev_cov.shape[0]), prev_cov]
 
-        return score
+        self.gamma = fitted_model.coef_
+        design_matrix = prev_cov
+
+        self.mu = design_matrix @ self.gamma.T
+
+    def update_sigma(self, nu):
+        """
+        Update the variance-covariance matrix for the logistic normal distribution of topical prevalence.
+
+        Parameters:
+        ----------
+        nu : _type_
+            Variance-covariance for the variational document-topic distribution.
+
+        Raises:
+        -------
+        AssertionError:
+            If the weight is not defined between 0 and 1.
+        """
+        assert 0 <= self.sigma_prior <= 1, 'Weight needs to be defined between 0 and 1.'
+
+        covariance = (self.lambda_ - self.mu).T @ (self.lambda_ - self.mu)
+        covariance = np.array(covariance, dtype=np.float64)
+
+        sigma = (covariance + nu) / self.lencorpus
+        sigma = np.array(sigma, dtype=np.float64)
+
+        self.sigma = np.diag(np.diag(sigma)) * self.sigma_prior + (1 - self.sigma_prior) * sigma
+
+    def update_beta(self, beta_ss):
+        """
+        Update the topic-word distribution beta.
+
+        Parameters:
+        ----------
+        beta_ss : np.ndarray
+            Sufficient statistic for word-topic distribution.
+
+        Notes:
+        ------
+        If self.LDAbeta is True, row-normalization of beta is performed for the update.
+        If self.LDAbeta is False, distributed Poisson Regression is used for the updates.
+        """
+        if self.LDAbeta:
+            assert np.any(np.sum(beta_ss, axis=1) >= 0), "Break here"
+            row_sums = np.sum(beta_ss, axis=1)[:, None]
+            # TODO: check if nan_to_num alters beta. 
+            self.beta = np.nan_to_num(self.beta)
+            self.beta = np.divide(
+                beta_ss, row_sums, out=np.zeros_like(beta_ss), where=row_sums != 0
+            )
+        else:
+            self.distributed_poisson_regression(beta_ss=beta_ss)
+
+    def distributed_poisson_regression(self, beta_ss):
+        """
+        Perform distributed Poisson regression for updating kappa and beta accordingly.
+
+        Parameters:
+        ----------
+        beta_ss : np.ndarray
+            Estimated word-topic distribution of the current EM iteration with dimensions K x V.
+
+        Notes:
+        ------
+        - Uses distributed Poisson regression to estimate coefficients for kappa and beta.
+        - Supports different cases for topic models and topic-aspect models.
+        - Handles fixed intercept and calculates predictions using the estimated coefficients.
+        """
+        interact = True
+        fixed_intercept = True
+        alpha = 250  # Corresponds to `lambda` in glmnet
+        max_iterations = int(1e4)
+        tolerance = 1e-5
+        num_aspects = len(self.yvarlevels)  
+        counts = csr_matrix(np.vstack(beta_ss))  # Dimensions: (A*K) x V # TODO: Enable dynamic creation of 'counts'
+
+        if num_aspects == 1:  # Topic Model
+            covar = np.diag(np.ones(self.num_topics))
+        else:  # Topic-Aspect Models
+            # if not contrast:
+            # Topics
+            veci = np.arange(0, counts.shape[0])
+            vecj = np.tile(np.arange(0, self.num_topics), num_aspects)
+            # Aspects
+            veci = np.concatenate((veci, np.arange(0, counts.shape[0])))
+            vecj = np.concatenate(
+                (
+                    vecj,
+                    np.repeat(
+                        np.arange(self.num_topics, self.num_topics + num_aspects),
+                        self.num_topics,
+                    ),
+                )
+            )
+            if interact:
+                veci = np.concatenate((veci, np.arange(0, counts.shape[0])))
+                vecj = np.concatenate(
+                    (
+                        vecj,
+                        np.arange(
+                            self.num_topics + num_aspects,
+                            self.num_topics + num_aspects + counts.shape[0],
+                        ),
+                    )
+                )  # TODO: Remove +1 at the end, make shapes fit anyway
+            vecv = np.ones(len(veci))
+            covar = csr_matrix((vecv, (veci, vecj)))
+
+        if fixed_intercept:
+            m = self.wcounts
+            m = np.log(m) - np.log(np.sum(m))
+        else:
+            m = 0
+
+        # Distributed Poissons
+        # TODO: Scale the data for convergence
+        out = []
+        # Now iterate over the vocabulary
+        for i in range(counts.shape[1]):
+            if np.all(m == 0):
+                fit_intercept = True
+            else:
+                fit_intercept = False
+            mod = None
+            clf = make_pipeline(StandardScaler(with_mean=False), PoissonRegressor(
+                fit_intercept=fit_intercept,
+                max_iter=np.int64(max_iterations),
+                tol=tolerance,
+                alpha=np.int64(alpha),
+            ))
+            mod = clf.fit(covar, counts[:, [i]].A.flatten())
+            # if it didn't converge, increase nlambda paths by 20%
+            # if(is.null(mod)) nlambda <- nlambda + floor(.2*nlambda)
+            # print(f'Estimated coefficients for word {i}.')
+            # print(mod.coef_)
+            # (0) out.append(mod.params)
+            out.append(mod.named_steps['poissonregressor'].coef_)
+
+        # Put all regression results together
+        coef = np.stack(out, axis=1)
+
+        # Separate intercept from the coefficients
+        if not fixed_intercept:
+            m = coef[0]
+            coef = coef[1:]
+
+        # Set kappa
+        self.kappa = coef
+
+        # Predict
+        linpred = covar @ coef
+        linpred = m + linpred
+        explinpred = np.exp(linpred)
+        beta = explinpred / np.sum(explinpred, axis=1)[:, np.newaxis]
+
+        # Retain former structure for beta
+        self.beta = np.array(np.split(beta, num_aspects, axis=0))
+
+    
+    def is_converged(self, iteration, convergence=None):
+        """
+        Check if the EM algorithm has converged based on the change in the objective function.
+
+        Parameters:
+        ----------
+        iteration : int
+            Current iteration of the EM algorithm.
+        convergence : float, optional
+            Threshold for convergence check, defaults to None.
+
+        Returns:
+        -------
+        bool:
+            True if the algorithm has converged, False otherwise.
+
+        Notes:
+        ------
+        - The convergence check is based on the relative change in the objective function.
+        - Requires at least two iterations to perform the check.
+        """
+        if iteration < 1:
+            return False
+
+        new_bound = self.bound
+        old_bound = self.last_bounds[-2]
+
+        convergence_check = np.abs((new_bound - old_bound) / np.abs(old_bound))
+        logging.info(f"relative change: {convergence_check}")
+        if convergence_check < self.convergence_threshold:
+            return True
+        else:
+            return False
 
     def show_topics(self, num_topics=10, num_words=10, log=False, formatted=True):
         """Get a representation for selected topics.
@@ -849,16 +1049,16 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         else:
             num_topics = min(num_topics, self.num_topics)
 
-            # add a little random jitter, to randomize results around the same alpha
-            sort_alpha = self.alpha + 0.0001 * self.random_state.rand(len(self.alpha))
+            # add a little random jitter, to randomize results around the same eta
+            sort_eta = self.eta + 0.0001 * self.random_state.rand(len(self.eta))
             # random_state.rand returns float64, but converting back to dtype won't speed up anything
 
-            sorted_topics = list(argsort(sort_alpha))
+            sorted_topics = list(argsort(sort_eta))
             chosen_topics = sorted_topics[:num_topics // 2] + sorted_topics[-num_topics // 2:]
 
         shown = []
 
-        topic = self.state.get_lambda()
+        topic = self.beta + self.sstats
         for i in chosen_topics:
             topic_ = topic[i]
             topic_ = topic_ / topic_.sum()  # normalize to probability distribution
@@ -869,7 +1069,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
             shown.append((i, topic_))
             if log:
-                logger.info("topic #%i (%.3f): %s", i, self.alpha[i], topic_)
+                logger.info("topic #%i (%.3f): %s", i, self.eta[i], topic_)
 
         return shown
 
@@ -1185,7 +1385,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                 z /= np.max(z)
 
         return z, annotation_terms
-
+    
     def __getitem__(self, bow, eps=None):
         """Get the topic distribution for the given document.
 
@@ -1222,7 +1422,7 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
           1. The pickled Python dictionaries will not work across Python versions
           2. The `save` method does not automatically save all numpy arrays separately, only
              those ones that exceed `sep_limit` set in :meth:`~gensim.utils.SaveLoad.save`. The main
-             concern here is the `alpha` array if for instance using `alpha='auto'`.
+             concern here is the `eta` array if for instance using `eta='auto'`.
 
         Please refer to the `wiki recipes section
         <https://github.com/RaRe-Technologies/gensim/wiki/
@@ -1272,14 +1472,14 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         # make sure 'expElogbeta' and 'sstats' are ignored from the pickled object, even if
         # someone sets the separately list themselves.
         separately_explicit = ['expElogbeta', 'sstats']
-        # Also add 'alpha' and 'eta' to separately list if they are set 'auto' or some
+        # Also add 'eta' and 'beta' to separately list if they are set 'auto' or some
         # array manually.
-        if (isinstance(self.alpha, str) and self.alpha == 'auto') or \
-                (isinstance(self.alpha, np.ndarray) and len(self.alpha.shape) != 1):
-            separately_explicit.append('alpha')
         if (isinstance(self.eta, str) and self.eta == 'auto') or \
                 (isinstance(self.eta, np.ndarray) and len(self.eta.shape) != 1):
             separately_explicit.append('eta')
+        if (isinstance(self.beta, str) and self.beta == 'auto') or \
+                (isinstance(self.beta, np.ndarray) and len(self.beta.shape) != 1):
+            separately_explicit.append('beta')
         # Merge separately_explicit with separately.
         if separately:
             if isinstance(separately, str):
@@ -1344,3 +1544,157 @@ class StmModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             except Exception as e:
                 logging.warning("failed to load id2word dictionary from %s: %s", id2word_fname, e)
         return result
+    
+    # TODO: function comment (AND BELOW)
+    def label_topics(self, topics, n, frexweight=0.5, print_labels=False):
+        """
+        Label topics
+
+        Generate a set of words describing each topic from a fitted STM object.
+
+        Highest Prob: are the words within each topic with the highest probability
+        (inferred directly from topic-word distribution parameter beta)
+        FREX: weights exclusivity and frequency scores to get more meaningful topic labels.
+        (Bischof and Airoldi 2012 for more details.)
+
+        @param topics number of topics to include.  Default
+        is all topics.
+        @param n The desired number of words (per type) used to label each topic.
+        Must be 1 or greater.
+        @param frexweight to control for exclusivity vs. frequency, defaults to 0.5
+        @param print_labels whether labels are returned or not, defaults to False
+
+        TODO: @return labelTopics object (list) \item{prob }{matrix of highest
+        probability words}
+        """
+        assert n >= 1, "n must be 1 or greater"
+
+        if topics is None:
+            topics = range(self.num_topics)
+
+        vocab = self.id2word
+        wordcounts = self.wcounts
+
+        if self.yvarlevels == None:
+            frex = self.frex(w=frexweight)
+
+            # Sort by word probabilities on each row of beta
+            # Returns words with highest probability per topic
+            problabels = np.argsort(-1 * self.beta)[:n]
+            frexlabels = np.argsort(-1 * frex)[:n]
+
+            out_prob = []
+            out_frex = []
+
+            for k in topics:
+                probwords = [itemgetter(i)(vocab) for i in problabels[k, :n]]
+                frexwords = [itemgetter(i)(vocab) for i in frexlabels[k, :n]]
+                if print_labels:
+                    print(f"Topic {k}:\n \t Highest Prob: {probwords}")
+                    print(f"Topic {k}:\n \t FREX: {frexwords}")
+                out_prob.append(probwords)
+                out_frex.append(frexwords)
+
+            return out_prob, out_frex
+        else:
+            labs = []
+            for x in self.kappa:
+                windex = np.argpartition(x, -n)[-n:]
+                sorted_indices = windex[np.argsort(x[windex])][::-1]
+                labs.append([vocab[i] if x[i] > 1e-5 else '' for i in sorted_indices])
+
+            labs = np.array(labs)
+
+            anames = self.yvarlevels
+            i1, i2 = self.num_topics, self.num_topics + len(self.yvarlevels)
+            out_topics = labs[topics]
+            out_covariate = labs[i1:i2]
+
+            if self.interactions:
+                intnums = np.arange(i2, labs.shape[0])
+                tindx = np.repeat(np.arange(0, self.num_topics), len(self.yvarlevels))
+                filtered_intnums = intnums[np.isin(tindx, topics)]
+                out_interaction = labs[filtered_intnums, :]
+
+            topiclabs = ["Topic Words:\n"]
+            topiclabs.extend([f"Topic {topic}: {', '.join(map(str, row))}\n" for topic, row in enumerate(out_topics)])
+
+            aspects = ["Covariate Words:\n"]
+            aspects.extend([f"Group {level}: {', '.join(map(str, row))}\n" for level, row in zip(anames, out_covariate)])
+
+            if self.interactions:
+                interactions = ["Topic-Covariate Interactions:\n"]
+                intlabs = np.array([", ".join(row) for row in out_interaction])
+                topicnums = np.concatenate([np.tile(topics, len(anames))])
+
+                for i in topics:
+                    topic_terms = intlabs[topicnums == i]
+                    for a, aspect_term in zip(anames, topic_terms):
+                        out = f"Topic {i}, Group {a}: {aspect_term} \n"
+                        interactions.append(out)
+
+                labels = topiclabs + ["\n"] + aspects + ["\n"] + interactions
+                print("".join(labels))
+                return out_topics, out_covariate, out_interaction
+            
+            labels = topiclabs + ["\n"] + aspects
+            print("".join(labels))
+            return out_topics, out_covariate, None
+
+    def frex(self, w=0.5):
+        """Calculate FREX (FRequency and EXclusivity) words
+        A primarily internal function for calculating FREX words.
+        Exclusivity is calculated by column-normalizing the beta matrix (thus representing the conditional probability of seeing
+        the topic given the word).  Then the empirical CDF of the word is computed within the topic.  Thus words with
+        high values are those where most of the mass for that word is assigned to the given topic.
+
+        @param logbeta a K by V matrix containing the log probabilities of seeing word v conditional on topic k
+        @param w a value between 0 and 1 indicating the proportion of the weight assigned to frequency
+
+        """
+        beta = np.log(self.beta)
+        log_exclusivity = beta - logsumexp(beta, axis=0)
+        exclusivity_ecdf = np.apply_along_axis(self.ecdf, 1, log_exclusivity)
+        freq_ecdf = np.apply_along_axis(self.ecdf, 1, beta)
+        out = 1.0 / (w / exclusivity_ecdf + (1 - w) / freq_ecdf)
+        return out
+
+    def find_thoughts(self, topics=None, threshold=0, n=3):
+        """
+        Return the most prominent documents for a certain topic in order to identify representative
+        documents. Topic representing documents might be conclusive underlying structure in the text
+        collection.
+        Following Roberts et al. (2016b):
+        Theta captures the modal estimate of the proportion of word
+        tokens assigned to the topic under the model.
+
+        @param: threshold (np.float) minimal theta value of the documents topic proportion
+            to be taken into account for the return statement.
+        @param: topics to get the representative documents for
+        @return: the top n document indices ranked by the MAP estimate of the topic's theta value
+
+        Example: Return the 10 most representative documents for the third topic:
+        > data.iloc[model.find_thoughts(topics=[3], n=10)]
+
+        """
+        assert n > 1, "Must request at least one returned document"
+        if n > self.lencorpus:
+            n = self.lencorpus
+
+        if topics is None:
+            topics = range(self.num_topics)
+
+        thoughts = []
+        for k in topics:
+            # grab the values and the rank
+            index = np.argsort(-1 * self.theta[:, k])[1:n]
+            val = -np.sort(-1 * self.theta[:, k])[1:n]
+            # subset to those values which meet the threshold
+            index = index[np.where(val >= threshold)]
+            # grab the document(s) corresponding to topic k
+            thoughts.append(index)
+        return thoughts
+
+    def ecdf(self, arr):
+        """Calculate the ECDF values for all elements in a 1D array."""
+        return rankdata(arr, method="max") / arr.size
