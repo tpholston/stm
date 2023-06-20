@@ -1,11 +1,14 @@
 import logging
 import queue
+import time
+from qpsolvers import solve_qp
 from multiprocessing import Pool, Queue, cpu_count
 
 import numpy as np
 import gensim.utils as gensim_utils
 
-from . import StmModel, StmState
+from . import StmModel, StmState, utils
+
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +17,13 @@ class StmMulticore(StmModel):
 	Multicore implementation of the STM model.
 	"""
 	def __init__(self, corpus=None, num_topics=100, id2word=None, workers=None,
-                     metadata=None, prevalence=None, content=None, chunksize=2000, 
+                 metadata=None, prevalence=None, content=None, chunksize=2000, 
          	     passes=1, batch=False, decay=0.5, offset=1.0, 
          	     eval_every=10, minimum_probability=0.01, random_state=None, 
          	     minimum_phi_value=0.01,  per_word_topics=False, callbacks=None, 
          	     dtype=np.float32, init_mode="Spectral", max_vocab=5000, 
          	     interactions=True, convergence_threshold=1e-5, LDAbeta=True, 
-         	     sigma_prior=0, model="STM", gamma_prior="L1"):
+         	     sigma_prior=0, model="STM", gamma_prior="OLS"):
 		"""
 		
 		Parameters
@@ -41,6 +44,72 @@ class StmMulticore(StmModel):
 			convergence_threshold=convergence_threshold, LDAbeta=LDAbeta, 
 			sigma_prior=sigma_prior, model=model, gamma_prior=gamma_prior
 		)
+	
+	def spectral_init(self, doc_word_freq, max_vocab):
+		"""
+		Perform spectral initialization.
+
+		Given a document-term frequency matrix, this method computes the gram matrix, selects anchor words,
+		and recovers the L2 matrix. It then constructs beta values for each aspect based on the selected top words.
+
+		Parameters
+		----------
+		doc_word_freq : numpy.ndarray
+			Document-term frequency matrix.
+		max_vocab : int
+			Maximum number of top words to select based on probabilities.
+
+		Returns
+		-------
+		numpy.ndarray
+			Beta values representing the topic-word distributions for each aspect.
+		"""
+		# Compute word probabilities
+		word_probabilities = np.sum(doc_word_freq, axis=0)
+		word_probabilities = word_probabilities / np.sum(word_probabilities)
+		word_probabilities = np.array(word_probabilities).flatten()
+
+		# Select top words based on probabilities
+		top_words_indices = np.argsort(-1 * word_probabilities)[:max_vocab]
+		doc_word_freq = doc_word_freq[:, top_words_indices]
+		word_probabilities = word_probabilities[top_words_indices]
+
+		# Prepare the Gram matrix
+		gram_matrix = utils.compute_gram_matrix(doc_word_freq)
+
+		# Compute anchor words
+		anchor_words = utils.fast_anchor(gram_matrix, self.num_topics)
+
+		M = gram_matrix[np.int64(anchor_words)]
+		P = np.dot(M, M.T).toarray()
+
+		G = np.eye(M.shape[0])
+		h = np.zeros(M.shape[0])
+		
+		args_list = [(gram_matrix, anchor_words, word_probabilities, i, M, P, G, h) for i in range(gram_matrix.shape[0])]
+
+		with Pool() as pool:
+			results = pool.map(recover_l2_helper, args_list)
+
+		weights = np.vstack(results)
+		A = weights.T * word_probabilities
+		A = A.T / np.sum(A, axis=1)
+
+		assert np.any(A > 0), "Negative probabilities for some words."
+		assert np.any(A < 1), "Word probabilities larger than one."
+
+		recovered_beta = A.T
+		if top_words_indices is not None:
+			updated_beta = np.zeros(self.num_topics * len(self.id2word)).reshape(self.num_topics, len(self.id2word))
+			updated_beta[:, top_words_indices] = recovered_beta
+			updated_beta += 0.001 / len(self.id2word)
+			recovered_beta = updated_beta / np.sum(updated_beta)
+
+		# Create a list of beta values for each aspect
+		if self.interactions:
+			recovered_beta = np.array([recovered_beta.copy() for _ in set(self.betaindex)])
+
+		return recovered_beta
 	
 	def update(self, corpus, chunks_as_numpy=False):
 		"""Train the model with new documents, by EM-iterating over the corpus until the topics converge, or until
@@ -126,37 +195,49 @@ class StmMulticore(StmModel):
 			STM model if necessary.
 
 			"""
+			#logger.warning(f"Merging for pass: {pass_}")
 			merged_new = False
 			while not result_queue.empty():
 				other.merge(result_queue.get())
 				queue_size[0] -= 1
 				merged_new = True
 
-			if (force and merged_new and queue_size[0] == 0) or (other.numdocs >= updateafter):
-				self.do_mstep(rho(), other, pass_ > 0)
-				other.reset()
-				if eval_every > 0 and (force or (self.num_updates / updateafter) % eval_every == 0):
-					self.log_perplexity(chunk, total_docs=self.lencorpus) # TODO: lencorpus log_perplexity
+			if (force and merged_new and queue_size[0] == 0):
+				self.bound = np.sum(other.calculated_bounds)
+				self.last_bounds.append(self.bound)
+				self.calculated_bounds = [] # reset bounds
+
+				elapsed_time = np.round((time.time() - start_estep), 3)
+
+				logger.info(f"Lower Bound: {self.bound}")
+				logger.info(f"Completed E-Step in {elapsed_time} seconds. \n")
+
+				self.do_mstep(other, pass_ > 0)
+				logger.warning(f"PASS {pass_}, {self.state.numdocs}")
+				# if eval_every > 0 and (force or (self.num_updates / updateafter) % eval_every == 0):
+				# 	self.log_perplexity(chunk, total_docs=self.lencorpus) # TODO: lencorpus log_perplexity
  
 		logger.info("training STM model using %i processes", self.workers)
 		pool = Pool(self.workers, do_worker_estep, (job_queue, result_queue, self))
 
+		first_start_time = time.time()
 		for pass_ in range(self.passes):
-			other = StmState(self.beta, self.state.sstats.shape, self.dtype)
-			dirty = False
-
-			sigma_ss = np.zeros(shape=self.sigma.shape)
-			beta_ss = np.zeros(shape=self.beta.shape)
-
+			other = StmState(self.beta, self.sigma, self.mu, self.theta_shape, self.lambda_shape, 
+                             self.beta.shape, self.sigma.shape, dtype=self.dtype)
+			self.state.reset()
 			queue_size, reallen = [0], 0
 			chunk_stream = gensim_utils.grouper(corpus, self.chunksize, as_numpy=chunks_as_numpy, dtype=self.dtype)
+
+			start_estep = time.time()
 			for chunk_no, chunk in enumerate(chunk_stream):
 				reallen += len(chunk)  # keep track of how many documents we've processed so far
 
+				chunk_indices = range(chunk_no * self.chunksize, min(chunk_no * self.chunksize + len(chunk), self.lencorpus))
+		
 				# put the chunk into the workers' input job queue
 				while True:
 					try:
-						job_queue.put((chunk_no, chunk, self.state), block=False)
+						job_queue.put((chunk_no, chunk, chunk_indices, self.state), block=False)
 						queue_size[0] += 1
 
 						logger.info(
@@ -168,17 +249,22 @@ class StmMulticore(StmModel):
 					except queue.Full:
 						# in case the input job queue is full, keep clearing the
 						# result queue, to make sure we don't deadlock
-						process_result_queue()
+						process_result_queue() # TODO: go back to this
 
 				process_result_queue()
 			
 			while queue_size[0] > 0:
-				process_result_queue(force=True)
+				process_result_queue(force=True)  
 
 			if reallen != self.lencorpus:
 				raise RuntimeError("input corpus size changed during training (don't use generators as input)")
 			
 		pool.terminate()
+
+		self.time_processed = time.time() - first_start_time
+		logger.warning(
+			f"({self.passes}) iterations conducted in {self.time_processed} seconds"
+		)
 
 def do_worker_estep(input_queue, result_queue, worker_stm):
 	"""Perform E-step for each job.
@@ -196,14 +282,30 @@ def do_worker_estep(input_queue, result_queue, worker_stm):
 	logger.debug("worker process entering E-step loop")
 	while True:
 		logger.debug("getting a new job")
-		chunk_no, chunk, w_state = input_queue.get()
+		chunk_no, chunk, chunk_indices, w_state = input_queue.get()
 		logger.debug("processing chunk #%i of %i documents", chunk_no, len(chunk))
 		worker_stm.state = w_state
-		worker_stm.sync_state()
 		worker_stm.state.reset()
-		worker_stm.do_estep(chunk)  # TODO: auto-tune alpha?
+		worker_stm.do_estep(chunk, chunk_indices)
+		#logger.warning(worker_stm.state.sigma_ss)
+		#logger.warning(worker_stm.sigma)
 		del chunk
 		logger.debug("processed chunk, queuing the result")
 		result_queue.put(worker_stm.state)
 		worker_stm.state = None
 		logger.debug("result put")
+
+def recover_l2_helper(args):
+    Qbar, anchors, word_probabilities, i, M, P, G, h = args
+    
+    if i in anchors:
+        vec = np.repeat(0, P.shape[0])
+        vec[np.where(anchors == i)] = 1
+        condprob = vec
+    else:
+        y = Qbar[i]
+        q = (M @ y.T).toarray().flatten()
+        solution = solve_qp(P=P, q=q, G=G, h=h, solver='quadprog')
+        condprob = -1 * solution
+
+    return condprob
